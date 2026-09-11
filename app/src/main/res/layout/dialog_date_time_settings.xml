@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+    Content view of HomeFragment.showDateTimeSettings()'s AlertDialog: the per-item settings of one
+    DATE_TIME grid item - text alignment and whether the screen-time line is shown. There is no
+    visibility control: date visibility is presence-only now (an item that exists always draws its
+    date line, hiding it means removing the widget), so the old On/Date only/Off RadioGroup is gone.
+    Same plain/unstyled approach as dialog_app_list_settings.xml.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingHorizontal="20dp"
+    android:paddingVertical="8dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/alignment" />
+
+    <RadioGroup
+        android:id="@+id/alignmentGroup"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <RadioButton
+            android:id="@+id/alignStart"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/left" />
+
+        <RadioButton
+            android:id="@+id/alignCenter"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/center" />
+
+        <RadioButton
+            android:id="@+id/alignEnd"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/right" />
+
+    </RadioGroup>
+
+    <androidx.appcompat.widget.SwitchCompat
+        android:id="@+id/screenTimeSwitch"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="@string/screen_time" />
+
+</LinearLayout>

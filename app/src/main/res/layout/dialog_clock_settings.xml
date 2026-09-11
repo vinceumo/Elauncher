@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+    Content view of HomeFragment.showClockSettings()'s AlertDialog: the per-item settings of one
+    CLOCK grid item - text alignment and nothing else (a clock has no count, no visibility and no
+    extra lines; hiding it means removing the widget). Same plain/unstyled approach as
+    dialog_app_list_settings.xml: dialog content lives in its own window with the dialog theme's own
+    text colors, and the app's custom font is applied at runtime instead
+    (FontManager.applyCustomTypeface).
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingHorizontal="20dp"
+    android:paddingVertical="8dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/alignment" />
+
+    <RadioGroup
+        android:id="@+id/alignmentGroup"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <RadioButton
+            android:id="@+id/alignStart"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/left" />
+
+        <RadioButton
+            android:id="@+id/alignCenter"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/center" />
+
+        <RadioButton
+            android:id="@+id/alignEnd"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/right" />
+
+    </RadioGroup>
+
+</LinearLayout>

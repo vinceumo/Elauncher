@@ -1,6 +1,13 @@
 apply plugin: 'com.android.application'
 apply plugin: 'kotlin-android'
 
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+def keystoreProperties = new Properties()
+def hasKeystoreProperties = keystorePropertiesFile.exists()
+if (hasKeystoreProperties) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
 android {
     compileSdk 36
 
@@ -14,14 +21,25 @@ android {
     }
 
     defaultConfig {
-        applicationId "app.olauncher"
+        applicationId "app.elauncher"
         minSdkVersion 24
         targetSdkVersion 36
-        versionCode 112
-        versionName "v6.9.1"
+        versionCode 113
+        versionName "v7.0.0"
 
         resourceConfigurations += ["en", "ar", "de", "es-rES", "es-rUS", "fr", "he", "hr", "hu", "in", "it", "ja", "ko", "nl", "pl", "pt-rBR", "ru-rRU", "sv", "tr", "uk", "zh"]
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        if (hasKeystoreProperties) {
+            release {
+                storeFile rootProject.file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
     }
 
     buildTypes {
@@ -29,6 +47,9 @@ android {
             debuggable false
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (hasKeystoreProperties) {
+                signingConfig signingConfigs.release
+            }
         }
         debug {
             debuggable true
@@ -41,7 +62,7 @@ android {
         viewBinding = true
         buildConfig = true
     }
-    namespace 'app.olauncher'
+    namespace 'app.elauncher'
 }
 
 dependencies {
@@ -50,6 +71,7 @@ dependencies {
     implementation libs.core.ktx
     implementation libs.appcompat
     implementation libs.recyclerview
+    implementation libs.viewpager2
 
     // Android lifecycle
     implementation libs.lifecycle.extensions
@@ -58,11 +80,13 @@ dependencies {
     // Navigation
     implementation libs.navigation.fragment.ktx
 
-    // Work Manager
-    implementation libs.work.runtime.ktx
-
     //Material dependency
     implementation libs.material
 
     testImplementation libs.junit
+    testImplementation libs.mockito.core
+    // The AGP unit-test classpath otherwise resolves org.json.* to android.jar's stub
+    // implementation (every method throws "not mocked"); this real implementation takes
+    // precedence on the test runtime classpath so Page.kt's JSON (de)serialization works.
+    testImplementation libs.org.json
 }

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- One page's content, inflated per-item by HomePagerAdapter. Pages are fully independent
+     (plan.md). The date/time header and screen-time label used to live here as fixed chrome
+     (see history.md Step 7) - Date & Screen Time is now a DATE_TIME GridItem rendered inside
+     HomeGridView like any other item (Step 10), not fixed per-page chrome. -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <!-- One HomeGridView per page, showing that page's items - see
+         HomeFragment.bindPage()/populateHomeGrid(). HomeGridView positions cells from its own
+         top-left corner and ignores its own padding, so the space around the grid is set here.
+
+         Horizontal: only enough to keep cells off the screen edge - the grid is meant to use the
+         full width. Whatever width isn't a whole number of cells is split between the two sides by
+         HomeGridView itself (gridOffsetX), so this is a floor, not the total gap.
+         Top: minimum breathing room now that the fixed date/time header is gone (Step 7) - matches
+         the side margins' "no disproportionate wasted edge space" goal (Constants.Grid.
+         VERTICAL_MARGIN_DP tracks this + the bottom margin below).
+         Bottom: the page-indicator dots row, untouched. -->
+    <app.elauncher.ui.HomeGridView
+        android:id="@+id/homeGridView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_marginHorizontal="8dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginBottom="48dp" />
+</FrameLayout>
