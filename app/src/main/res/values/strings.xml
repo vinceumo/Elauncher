@@ -176,6 +176,7 @@
     <string name="add_clock">Add clock</string>
     <string name="add_date_time">Add date</string>
     <string name="edit_widget">Edit widget</string>
+    <string name="change_app">Change app</string>
     <string name="remove_this_app">Remove this app</string>
     <string name="rename_app">Rename app</string>
     <string name="widget_unavailable">Widget unavailable\nTap to remove</string>
