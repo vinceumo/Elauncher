@@ -180,6 +180,7 @@
     <string name="remove_this_app">Remove this app</string>
     <string name="rename_app">Rename app</string>
     <string name="widget_unavailable">Widget unavailable\nTap to remove</string>
+    <string name="widget_picker_empty">No widgets found</string>
     <string name="app_list_placeholder">App list</string>
     <string name="date_time_placeholder">Date &amp; time</string>
     <string name="settings">Settings</string>

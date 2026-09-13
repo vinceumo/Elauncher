@@ -10,32 +10,46 @@ import android.os.UserHandle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.widget.SearchView
+import androidx.core.view.isVisible
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
 import app.elauncher.R
 import app.elauncher.data.Prefs
+import app.elauncher.databinding.ActivityWidgetPickerBinding
+import app.elauncher.ui.WidgetPickerAdapter
+import kotlinx.coroutines.launch
 
 /**
- * Runs the full "add a widget to this cell" round trip - pick a provider, bind it to a freshly
- * allocated widget id, and (when the provider asks for one) run its configuration activity -
- * then hands the resulting widget id plus the target cell back to HomeFragment through Prefs and
- * finishes.
+ * Runs the full "add a widget to this cell" round trip - pick a provider from this screen's own
+ * grouped-by-app list, bind it to a freshly allocated widget id, and (when the provider asks for
+ * one) run its configuration activity - then hands the resulting widget id plus the target cell
+ * back to HomeFragment through Prefs and finishes.
  *
- * Like [FontPickerActivity], this exists solely to work around a real, confirmed-on-device
- * Android platform issue: MainActivity is `android:launchMode="singleTask"` (required for a
- * HOME/launcher app), and registerForActivityResult()'s callback silently never fires when a
- * singleTask Activity is the one waiting on a result from another app's flow - verified on device
- * in Steps 14-15 with the font picker. Every stage of this flow (ACTION_APPWIDGET_PICK,
- * ACTION_APPWIDGET_BIND, ACTION_APPWIDGET_CONFIGURE) is exactly that kind of cross-app round trip,
- * so the whole thing runs here, in a plain (default `standard` launch mode) activity, and
- * HomeFragment never waits on a result at all - it just observes the pendingWidget* Prefs fields
- * when the user naturally returns home (see HomeFragment.consumePendingWidgetPlacement()).
+ * Picking happens in-app: this activity's own layout hosts a searchable [WidgetPickerAdapter] list
+ * built by `buildWidgetPickerItems()`, so the system's plain-text ACTION_APPWIDGET_PICK screen is
+ * never involved. Only the two later stages (ACTION_APPWIDGET_BIND, ACTION_APPWIDGET_CONFIGURE)
+ * are still cross-app round trips.
+ *
+ * Like [FontPickerActivity], this activity nevertheless exists solely to work around a real,
+ * confirmed-on-device Android platform issue: MainActivity is `android:launchMode="singleTask"`
+ * (required for a HOME/launcher app), and registerForActivityResult()'s callback silently never
+ * fires when a singleTask Activity is the one waiting on a result from another app's flow -
+ * verified on device in Steps 14-15 with the font picker. Both remaining stages are exactly that
+ * kind of cross-app round trip, so the whole thing runs here, in a plain (default `standard` launch
+ * mode) activity, and HomeFragment never waits on a result at all - it just observes the
+ * pendingWidget* Prefs fields when the user naturally returns home (see
+ * HomeFragment.consumePendingWidgetPlacement()).
  *
  * Extends plain [ComponentActivity], not AppCompatActivity: this activity stays alive across the
- * picker round trips, so AppCompatActivity's onPostCreate() would reach AppCompatDelegate's
- * subdecor setup and crash against this manifest entry's plain Theme.Translucent.NoTitleBar (same
- * reasoning as FontPickerActivity - see its kdoc). registerForActivityResult() is an
- * androidx.activity API, so it is available here regardless.
+ * bind/configure round trips, so AppCompatActivity's onPostCreate() would reach AppCompatDelegate's
+ * subdecor setup and crash (same reasoning as FontPickerActivity - see its kdoc). The manifest
+ * entry's `@style/AppTheme` is safe despite that: the crash needs AppCompatDelegate, which is only
+ * ever invoked by an AppCompatActivity, and this stays a plain ComponentActivity - while the theme
+ * is required for `?attr/mainFontFamily` (used by this layout's text styles) to resolve.
+ * registerForActivityResult() is an androidx.activity API, so it is available here regardless.
  *
- * All three launchers are registered as fields: registerForActivityResult() may only be called
+ * Both launchers are registered as fields: registerForActivityResult() may only be called
  * before the activity is STARTED, so a multi-stage flow cannot register a launcher mid-flow. The
  * stage-to-stage state (allocated id, target cell, chosen provider) lives in the fields below.
  */
@@ -48,27 +62,12 @@ class WidgetPickerActivity : ComponentActivity() {
     /** Set once a provider is bound, so the configure-result callback can confirm what it configured. */
     private var pendingProviderInfo: AppWidgetProviderInfo? = null
 
-    private val pickLauncher =
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            if (result.resultCode != Activity.RESULT_OK) {
-                abort(showError = false)
-                return@registerForActivityResult
-            }
-            // The system picker usually binds the widget itself (it holds BIND_APPWIDGET), in which
-            // case the provider is already readable back off our id and there is nothing to bind.
-            val boundInfo = WidgetHostManager.providerInfoFor(this, appWidgetId)
-            if (boundInfo != null) {
-                onProviderBound(boundInfo)
-                return@registerForActivityResult
-            }
-            val provider = result.data?.parcelableExtra<ComponentName>(AppWidgetManager.EXTRA_APPWIDGET_PROVIDER)
-            if (provider == null) {
-                Log.e(TAG, "Picker returned OK with neither a bound widget nor a provider")
-                abort(showError = true)
-                return@registerForActivityResult
-            }
-            bindProvider(provider, result.data?.parcelableExtra(AppWidgetManager.EXTRA_APPWIDGET_PROVIDER_PROFILE))
-        }
+    /**
+     * One-shot guard: widget ids are allocated the moment a row is tapped, so a fast double-tap or
+     * a multi-touch across two rows of the list could otherwise allocate twice and race. Never
+     * needs resetting - [abort] always finishes the activity, so no further tap can follow.
+     */
+    private var widgetChosen = false
 
     private val bindLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -94,23 +93,53 @@ class WidgetPickerActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.setBackgroundDrawable(null)
+        val binding = ActivityWidgetPickerBinding.inflate(layoutInflater)
+        setContentView(binding.root)
 
         targetCol = intent.getIntExtra(EXTRA_COL, -1)
         targetRow = intent.getIntExtra(EXTRA_ROW, -1)
-        appWidgetId = WidgetHostManager.allocateWidgetId(this)
 
-        val pickIntent = Intent(AppWidgetManager.ACTION_APPWIDGET_PICK)
-            .putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, appWidgetId)
-        if (pickIntent.resolveActivity(packageManager) == null) {
-            // No system widget picker on this device. An in-app provider list is the documented
-            // fallback, but it is deliberately not built speculatively - if device testing shows
-            // this branch is ever reached, that is the point to add it.
-            Log.e(TAG, "No activity resolves ACTION_APPWIDGET_PICK")
-            abort(showError = true)
-            return
+        binding.root.setBackgroundColor(themedBackgroundColor(Prefs(this).backgroundOpacity))
+        FontManager.applyCustomTypeface(binding.root)
+
+        val adapter = WidgetPickerAdapter(
+            onWidgetSelected = { info, profile -> onWidgetChosen(info, profile) },
+        )
+        binding.widgetsRecyclerView.layoutManager = LinearLayoutManager(this)
+        binding.widgetsRecyclerView.adapter = adapter
+
+        lifecycleScope.launch {
+            val items = buildWidgetPickerItems(this@WidgetPickerActivity)
+            adapter.submitFullList(items)
+            binding.emptyState.isVisible = items.isEmpty()
+            // Hidden rather than left empty so the empty-state text centres in the full screen
+            // (a GONE sibling is excluded from the LinearLayout weight split).
+            binding.widgetsRecyclerView.isVisible = items.isNotEmpty()
         }
-        pickLauncher.launch(pickIntent)
+
+        binding.search.setOnQueryTextListener(object : SearchView.OnQueryTextListener {
+            // Nothing to submit to: this screen has no bang-search/auto-launch behaviour, the
+            // list is already filtered live by onQueryTextChange.
+            override fun onQueryTextSubmit(query: String?): Boolean = true
+
+            override fun onQueryTextChange(newText: String): Boolean {
+                adapter.filter.filter(newText)
+                return true
+            }
+        })
+    }
+
+    /**
+     * A row was tapped: the provider is already known, so unlike the old system-picker round trip
+     * there is no result to parse - allocate the id now (deliberately not up front in [onCreate],
+     * so backing out of this screen never leaks one) and go straight to binding.
+     */
+    private fun onWidgetChosen(info: AppWidgetProviderInfo, profile: UserHandle) {
+        if (widgetChosen) return
+        widgetChosen = true
+        appWidgetId = WidgetHostManager.allocateWidgetId(this)
+        val boundProfile = if (profile == android.os.Process.myUserHandle()) null else profile
+        bindProvider(info.provider, boundProfile)
     }
 
     /**
@@ -194,10 +223,6 @@ class WidgetPickerActivity : ComponentActivity() {
         if (showError) showToast(R.string.widget_pin_failed)
         finish()
     }
-
-    @Suppress("DEPRECATION")
-    private inline fun <reified T> Intent.parcelableExtra(name: String): T? =
-        getParcelableExtra(name) as? T
 
     companion object {
         private const val TAG = "WidgetPickerActivity"
