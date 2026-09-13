@@ -6,6 +6,7 @@ import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProviderInfo
 import android.content.Context
 import android.os.Bundle
+import android.os.UserHandle
 import android.util.Log
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -164,4 +165,8 @@ object WidgetHostManager {
     /** The provider behind a bound widget id, or null if the id isn't bound (or no longer valid). */
     fun providerInfoFor(context: Context, appWidgetId: Int): AppWidgetProviderInfo? =
         manager(context).getAppWidgetInfo(appWidgetId)
+
+    /** Every widget provider installed for [profile], read-only (no host state changes). */
+    fun installedProvidersForProfile(context: Context, profile: UserHandle): List<AppWidgetProviderInfo> =
+        manager(context).getInstalledProvidersForProfile(profile)
 }

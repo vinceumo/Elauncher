@@ -73,7 +73,7 @@
         <activity
             android:name=".helper.WidgetPickerActivity"
             android:exported="false"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+            android:theme="@style/AppTheme" />
 
         <activity
             android:name=".helper.FakeHomeActivity"
