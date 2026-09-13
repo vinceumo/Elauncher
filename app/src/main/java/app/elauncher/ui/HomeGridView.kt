@@ -97,9 +97,9 @@ class HomeGridView @JvmOverloads constructor(
     private var dateTextProvider: (() -> String)? = null
     private var screenTimeTextProvider: (() -> String?)? = null
     private var onClockClick: (() -> Unit)? = null
-    private var onClockLongClick: (() -> Unit)? = null
+    private var onClockLongClick: ((GridItem) -> Unit)? = null
     private var onDateClick: (() -> Unit)? = null
-    private var onDateLongClick: (() -> Unit)? = null
+    private var onDateLongClick: ((GridItem) -> Unit)? = null
 
     /** The item currently being edited, identified by reference into [items]. Null when not editing. */
     private var editingItem: GridItem? = null
@@ -157,9 +157,9 @@ class HomeGridView @JvmOverloads constructor(
         dateTextProvider: (() -> String)? = null,
         screenTimeTextProvider: (() -> String?)? = null,
         onClockClick: (() -> Unit)? = null,
-        onClockLongClick: (() -> Unit)? = null,
+        onClockLongClick: ((GridItem) -> Unit)? = null,
         onDateClick: (() -> Unit)? = null,
-        onDateLongClick: (() -> Unit)? = null,
+        onDateLongClick: ((GridItem) -> Unit)? = null,
     ) {
         this.items = items
         this.touchListenerFor = touchListenerFor
@@ -464,7 +464,7 @@ class HomeGridView @JvmOverloads constructor(
                     gravity = item.alignment
                     if (customTypeface != null) setTypeface(customTypeface, typeface?.style ?: Typeface.NORMAL)
                     onClockClick?.let { onClick -> setOnClickListener { onClick() } }
-                    onClockLongClick?.let { onLongClick -> setOnLongClickListener { onLongClick(); true } }
+                    onClockLongClick?.let { onLongClick -> setOnLongClickListener { onLongClick(item); true } }
                 },
                 dateTimeLineParams(),
             )
@@ -494,9 +494,11 @@ class HomeGridView @JvmOverloads constructor(
      *
      * Tap/long-press for the date line is a plain click listener (not the swipe-gesture touch
      * listeners [touchListenerFor]/[slotTouchListenerFor] give cells/slots): the pre-Step-7 header
-     * never supported swiping over the clock/date either, only tap-to-launch and
-     * long-press-to-reassign, so this reproduces that exactly rather than inventing new gesture
-     * support for it.
+     * never supported swiping over the clock/date either, only tap-to-launch. Long-press opens a
+     * small "Change app" / "Edit widget" choice (HomeFragment.showDateLongPressOptions) rather
+     * than jumping straight to reassignment - since this line fills the whole cell, a plain
+     * long-press-to-reassign (the original, pre-Step-7 behavior) left no way to reach edit mode at
+     * all, the same problem App List's per-slot options dialog already solves for its slots.
      */
     private fun createDateTimeView(item: GridItem, customTypeface: Typeface?): View =
         LinearLayout(context).apply {
@@ -514,7 +516,7 @@ class HomeGridView @JvmOverloads constructor(
                     ellipsize = android.text.TextUtils.TruncateAt.END
                     if (customTypeface != null) setTypeface(customTypeface, typeface?.style ?: Typeface.NORMAL)
                     onDateClick?.let { onClick -> setOnClickListener { onClick() } }
-                    onDateLongClick?.let { onLongClick -> setOnLongClickListener { onLongClick(); true } }
+                    onDateLongClick?.let { onLongClick -> setOnLongClickListener { onLongClick(item); true } }
                 },
                 dateTimeLineParams(),
             )
@@ -584,8 +586,24 @@ class HomeGridView @JvmOverloads constructor(
                     postDelayed(longPressCheck, widgetLongPressTimeoutMs)
                 }
 
-                MotionEvent.ACTION_MOVE ->
-                    if (hypot(ev.x - downX, ev.y - downY) > touchSlopPx) cancelPendingLongPress()
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = ev.x - downX
+                    val dy = ev.y - downY
+                    if (hypot(dx, dy) > touchSlopPx) {
+                        cancelPendingLongPress()
+                        // A predominantly-horizontal drag this early is a page-swipe attempt, not
+                        // something the widget's own content should get first: without this, a
+                        // widget with any full-bleed touchable surface (most of them) claims the
+                        // whole gesture at ACTION_DOWN and a swipe over it opens the widget instead
+                        // of changing pages. Claiming it here hands the rest of the gesture to this
+                        // container - which already has the same swipe-gesture listener every other
+                        // cell uses attached via setOnTouchListener (see rebuildChildren) - the same
+                        // "steal the gesture past touch-slop" pattern scrollable containers use.
+                        // Vertical drags are left alone, so a widget with its own vertical content
+                        // (e.g. a scrollable list) keeps working exactly as before.
+                        if (abs(dx) > abs(dy)) triggered = true
+                    }
+                }
 
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> cancelPendingLongPress()
             }

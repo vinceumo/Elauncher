@@ -190,10 +190,11 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
     }
 
     /**
-     * Long-press-to-reassign for the DATE_TIME widget's clock line. This exact flow lived inline
-     * in onLongClick's `when (view.id)` until Step 7 removed the fixed header view it dispatched
-     * from; reconstructed here as its own function so it can be wired onto the dynamically-built
-     * clock TextClock instead (no fixed R.id to switch on any more). Clearing the assignment
+     * Reassigns the clock line's launch target. This exact flow lived inline in onLongClick's
+     * `when (view.id)` until Step 7 removed the fixed header view it dispatched from;
+     * reconstructed here as its own function, now called from [showClockLongPressOptions]'s
+     * "Change app" choice rather than directly from the long-press (see that function's kdoc for
+     * why long-press needed a menu instead of jumping straight here). Clearing the assignment
      * before opening the picker is what makes MainViewModel's save flow treat the next pick as a
      * fresh assignment rather than appending.
      */
@@ -212,6 +213,37 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
         prefs.calendarAppUser = ""
     }
 
+    /**
+     * Long press on the clock line: same shape as showAppSlotOptions() - the clock/date text fills
+     * its item's whole cell (same reasoning as the App List slots it mirrors), so a plain
+     * long-press-to-reassign left no route into edit mode at all. "Change app" keeps the old
+     * behavior; "Edit widget" is the new one.
+     */
+    private fun showClockLongPressOptions(item: GridItem) {
+        val options = arrayOf(getString(R.string.change_app), getString(R.string.edit_widget))
+        val dialog = AlertDialog.Builder(requireContext())
+            .setItems(options) { dialog, which ->
+                dialog.dismiss()
+                if (which == 0) reassignClockApp() else currentHomeGridView()?.enterEditMode(item)
+            }
+            .setNegativeButton(R.string.cancel) { dialog, _ -> dialog.dismiss() }
+            .show()
+        dialog.window?.decorView?.let { FontManager.applyCustomTypeface(it) }
+    }
+
+    /** Same as [showClockLongPressOptions], for the date line / calendar app. */
+    private fun showDateLongPressOptions(item: GridItem) {
+        val options = arrayOf(getString(R.string.change_app), getString(R.string.edit_widget))
+        val dialog = AlertDialog.Builder(requireContext())
+            .setItems(options) { dialog, which ->
+                dialog.dismiss()
+                if (which == 0) reassignCalendarApp() else currentHomeGridView()?.enterEditMode(item)
+            }
+            .setNegativeButton(R.string.cancel) { dialog, _ -> dialog.dismiss() }
+            .show()
+        dialog.window?.decorView?.let { FontManager.applyCustomTypeface(it) }
+    }
+
     override fun onLongClick(view: View): Boolean {
         when (view.id) {
             R.id.setDefaultLauncher -> {
@@ -225,9 +257,9 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
             // R.id.clock/date/tvScreenTime handled long-press-to-reassign here until Step 7
             // removed the fixed header views they belonged to (the FLAG_SET_CLOCK_APP/
             // FLAG_SET_CALENDAR_APP/FLAG_SET_SCREEN_TIME_APP showAppList() flows themselves are
-            // untouched, still wired up in AppDrawerFragment) - reassignClockApp()/
-            // reassignCalendarApp() above are now wired directly as onLongClickListeners on the
-            // DATE_TIME widget's own dynamically-built views instead (see populateHomeGridFor()).
+            // untouched, still wired up in AppDrawerFragment) - showClockLongPressOptions()/
+            // showDateLongPressOptions() are now wired as onLongClickListeners on the DATE_TIME/
+            // CLOCK widgets' own dynamically-built views instead (see populateHomeGridFor()).
         }
         return true
     }
@@ -397,7 +429,7 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
                     setBackgroundResource(R.drawable.page_indicator_dot)
                     alpha = if (i == selectedIndex) 1f else 0.4f
                     setOnClickListener {
-                        binding.homePager.setCurrentItem(i, true)
+                        binding.homePager.setCurrentItem(i, !prefs.reduceAnimations)
                         prefs.currentPageIndex = i
                         refreshPageIndicator(i)
                     }
@@ -449,9 +481,9 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
             dateTextProvider = ::formatDateText,
             screenTimeTextProvider = ::currentScreenTimeText,
             onClockClick = ::openClockApp,
-            onClockLongClick = ::reassignClockApp,
+            onClockLongClick = { item -> showClockLongPressOptions(item) },
             onDateClick = ::openCalendarApp,
-            onDateLongClick = ::reassignCalendarApp,
+            onDateLongClick = { item -> showDateLongPressOptions(item) },
         )
     }
 
@@ -1118,7 +1150,7 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
         val current = binding.homePager.currentItem
         val target = if (forward) current + 1 else current - 1
         if (target !in 0 until pageCount) return false
-        binding.homePager.setCurrentItem(target, true)
+        binding.homePager.setCurrentItem(target, !prefs.reduceAnimations)
         return true
     }
 
