@@ -34,13 +34,18 @@ import app.elauncher.data.Constants
 import app.elauncher.data.DEFAULT_APP_LIST_SLOT_COUNT
 import app.elauncher.data.GridItem
 import app.elauncher.data.GridItemType
+import app.elauncher.data.MAX_APP_LIST_SLOT_COUNT
+import app.elauncher.data.MIN_APP_LIST_SLOT_COUNT
 import app.elauncher.data.Prefs
 import app.elauncher.data.defaultAppListSpanX
+import app.elauncher.data.defaultAppListSpanXForSlots
 import app.elauncher.data.defaultAppListSpanY
+import app.elauncher.data.defaultAppListSpanYForGrid
 import app.elauncher.data.defaultClockSpanX
 import app.elauncher.data.defaultClockSpanY
 import app.elauncher.data.defaultDateTimeSpanX
 import app.elauncher.data.defaultDateTimeSpanY
+import app.elauncher.data.resizeAppSlots
 import app.elauncher.databinding.DialogAppListSettingsBinding
 import app.elauncher.databinding.DialogClockSettingsBinding
 import app.elauncher.databinding.DialogDateTimeSettingsBinding
@@ -242,6 +247,60 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
             .setNegativeButton(R.string.cancel) { dialog, _ -> dialog.dismiss() }
             .show()
         dialog.window?.decorView?.let { FontManager.applyCustomTypeface(it) }
+    }
+
+    /**
+     * Long press on an item that overlaps another one: the same menu shape as
+     * [showClockLongPressOptions]/[showAppSlotOptions], carrying everything a stack needs that a
+     * single item doesn't.
+     *
+     * Only overlapping items get here (HomeGridView.handleItemLongPress decides), for two reasons:
+     * reordering is meaningless without something to reorder against, and a lone item's long press
+     * is the common path - it stays the one gesture that drops straight into edit mode, with no menu
+     * in the way.
+     *
+     * Move / Resize is that same edit mode, unchanged, now one tap further away for a stacked item.
+     * Settings and Remove duplicate the edit-mode gear and delete badges deliberately: both are
+     * already reachable, but only *after* selecting an item - which is the fiddly part when items
+     * sit on top of each other, and is exactly what this menu has already resolved.
+     */
+    private fun showItemLongPressOptions(item: GridItem) {
+        val entries = buildList<Pair<String, () -> Unit>> {
+            add(getString(R.string.move_or_resize) to { currentHomeGridView()?.enterEditMode(item) })
+            add(getString(R.string.bring_to_front) to { applyStackingAction(item, StackingAction.BRING_TO_FRONT) })
+            add(getString(R.string.bring_forward) to { applyStackingAction(item, StackingAction.BRING_FORWARD) })
+            add(getString(R.string.send_backward) to { applyStackingAction(item, StackingAction.SEND_BACKWARD) })
+            add(getString(R.string.send_to_back) to { applyStackingAction(item, StackingAction.SEND_TO_BACK) })
+            // Exactly the items that get a gear badge in edit mode answer true here - the rule lives
+            // in HomeGridView with the badge it was written for, rather than being restated.
+            if (currentHomeGridView()?.hasSettings(item) == true) {
+                add(getString(R.string.settings) to { showItemSettings(item) })
+            }
+            add(getString(R.string.remove_widget) to { removeGridItem(item) })
+        }
+
+        val dialog = AlertDialog.Builder(requireContext())
+            .setItems(entries.map { it.first }.toTypedArray()) { dialog, which ->
+                dialog.dismiss()
+                entries[which].second()
+            }
+            .setNegativeButton(R.string.cancel) { dialog, _ -> dialog.dismiss() }
+            .show()
+        dialog.window?.decorView?.let { FontManager.applyCustomTypeface(it) }
+    }
+
+    /**
+     * Restacks [item] within its page and writes the result.
+     *
+     * [updateGridItem] does all the work: it hands the mutation the current page's *own* copy of the
+     * item together with the rest of that page's items - which is precisely what a stacking action
+     * needs, since every one of them places the item relative to the others' zIndex values - then
+     * persists the page and re-renders it. The two-item cases (forward/backward swap the item's
+     * zIndex with its neighbour's) need nothing extra: the neighbour is another element of that same
+     * list, so mutating it is written back by the same save.
+     */
+    private fun applyStackingAction(item: GridItem, action: StackingAction) {
+        updateGridItem(item) { target, items -> applyStacking(target, items, action) }
     }
 
     override fun onLongClick(view: View): Boolean {
@@ -475,6 +534,10 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
             // Edit mode's gear badge (Step 11): HomeGridView only reports the tap, the per-item
             // settings themselves are edited here, where Prefs and the dialog theme live.
             onOpenSettings = ::showItemSettings,
+            // The long-press menu for a stacked item (plan 005 Step 7): HomeGridView decides when a
+            // long press means "which of these, and in what order?" rather than "edit this", and
+            // this fragment owns the dialog that asks - same split as onOpenSettings above.
+            onStackedItemLongPress = ::showItemLongPressOptions,
             // DATE_TIME rendering/wiring (Step 10): HomeGridView touches no Prefs/Context itself,
             // so the formatted text and the clock/date tap/long-press flows are handed in the same
             // way the touch listeners above are.
@@ -754,6 +817,11 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
     private fun showAppListSettings(item: GridItem) {
         val content = DialogAppListSettingsBinding.inflate(layoutInflater)
         content.alignmentGroup.check(alignmentRadioId(item.alignment))
+        content.directionGroup.check(directionRadioId(item.direction))
+        relabelAlignmentButtons(content, item.direction)
+        content.directionGroup.setOnCheckedChangeListener { _, checkedId ->
+            relabelAlignmentButtons(content, directionFor(checkedId))
+        }
 
         var slotCount = item.appSlots.size.coerceIn(MIN_APP_LIST_SLOT_COUNT, MAX_APP_LIST_SLOT_COUNT)
         fun renderCount() {
@@ -778,6 +846,7 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
                 applyAppListSettings(
                     item = item,
                     alignment = alignmentFor(content.alignmentGroup.checkedRadioButtonId),
+                    direction = directionFor(content.directionGroup.checkedRadioButtonId),
                     slotCount = slotCount,
                 )
                 dialog.dismiss()
@@ -790,22 +859,40 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
     /**
      * Writes an App List item's settings back.
      *
-     * Growing the slot count appends empty slots, shrinking drops the trailing ones - filled or not,
-     * immediately and unconfirmed, the same rule removeGridItem()/clearAppSlot() already follow for
-     * comparably scoped actions (an app leaves the home screen; nothing is uninstalled). The item's
-     * height follows the count, keeping the one-slot-per-row invariant HomeGridView's row rendering
-     * assumes; clamped to the grid the same way addAppList() clamps a new item's, and to whatever
-     * sits below it on the page (clampSpanYToOverlap) so growing this item can't silently occlude a
-     * neighbor's origin cell the way HomeGridView.rebuildChildren()'s occupied-cell skip would.
+     * The slot count is applied by [resizeAppSlots] - the *only* place an App List's slot count
+     * ever changes; dragging a resize handle never touches it (see HomeGridView.resizeConstraints'
+     * APP_LIST branch and [resizeAppSlots]'s own kdoc). After a count/direction change, the span
+     * along the list's own direction is re-derived from the new count as a fresh starting point -
+     * clamped to the grid the same way addAppList() clamps a new item's, and no further (growing
+     * over a neighbour is allowed here for the same reason drag-resize allows it:
+     * clampSpanYToGrid/clampSpanXToGrid). A later drag is free to move that axis away from the
+     * count again; the two are not kept in sync continuously, only re-aligned at the moment the
+     * count itself changes. The cross-axis span is purely visual and is left alone here.
+     *
+     * The same count-following recompute also runs when [direction] alone changes (slot count
+     * untouched): toggling direction swaps which axis is the count-following one, so the span that
+     * used to follow the old direction is stale the moment the axis swaps - the count-following span
+     * is re-derived for the new direction, exactly as if the count had just been set to its current
+     * value. This makes toggling direction visibly resize the item immediately, per plan.md's
+     * "toggleable anytime" decision, rather than waiting for an unrelated slot-count edit to fix it.
      */
-    private fun applyAppListSettings(item: GridItem, alignment: Int, slotCount: Int) {
-        updateGridItem(item) { target, items ->
+    private fun applyAppListSettings(item: GridItem, alignment: Int, direction: Int, slotCount: Int) {
+        updateGridItem(item) { target, _ ->
             target.alignment = alignment
-            if (target.appSlots.size != slotCount) {
-                while (target.appSlots.size < slotCount) target.appSlots.add(AppSlot())
-                while (target.appSlots.size > slotCount) target.appSlots.removeAt(target.appSlots.size - 1)
-                val desiredSpanY = defaultAppListSpanY(slotCount).coerceAtMost(gridGeometry().second.coerceAtLeast(1))
-                target.spanY = clampSpanYToOverlap(target, items, desiredSpanY, gridGeometry().second)
+            val directionChanged = target.direction != direction
+            val countChanged = target.appSlots.size != slotCount
+            target.direction = direction
+            target.resizeAppSlots(slotCount)
+            if (countChanged || directionChanged) {
+                val (columnCount, rowCount) = gridGeometry()
+                if (direction == LinearLayout.HORIZONTAL) {
+                    val desiredSpanX = defaultAppListSpanXForSlots(slotCount)
+                        .coerceAtMost(columnCount.coerceAtLeast(1))
+                    target.spanX = clampSpanXToGrid(target, desiredSpanX, columnCount)
+                } else {
+                    val desiredSpanY = defaultAppListSpanY(slotCount).coerceAtMost(rowCount.coerceAtLeast(1))
+                    target.spanY = clampSpanYToGrid(target, desiredSpanY, rowCount)
+                }
             }
         }
     }
@@ -894,15 +981,15 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
      * dateTimeVisibility is deliberately left alone: the field is dead after the clock/date split's
      * migration (see GridItem's kdoc) and nothing writes it any more.
      *
-     * Growing spanY (turning screen time on) is clamped to whatever sits below this item on the
-     * page (clampSpanYToOverlap), for the same reason applyAppListSettings() clamps it.
+     * Growing spanY (turning screen time on) is clamped to the grid (clampSpanYToGrid), for the same
+     * reason applyAppListSettings() clamps it.
      */
     private fun applyDateTimeSettings(item: GridItem, alignment: Int, showScreenTime: Boolean) {
-        updateGridItem(item) { target, items ->
+        updateGridItem(item) { target, _ ->
             target.alignment = alignment
             target.showScreenTime = showScreenTime
             val desiredSpanY = defaultDateTimeSpanY(showScreenTime).coerceAtMost(gridGeometry().second.coerceAtLeast(1))
-            target.spanY = clampSpanYToOverlap(target, items, desiredSpanY, gridGeometry().second)
+            target.spanY = clampSpanYToGrid(target, desiredSpanY, gridGeometry().second)
         }
     }
 
@@ -914,52 +1001,29 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
      * was opened with is never the same object a fresh read returns.
      *
      * [mutate] also receives the current page's item list (the same list [target] came from, by
-     * reference) so a mutation that changes span can check it against the rest of the page - see
-     * clampSpanYToOverlap().
+     * reference), so a mutation whose result depends on the rest of the page - a span checked
+     * against its neighbours, a zIndex placed relative to theirs - can see it.
      */
     private fun updateGridItem(item: GridItem, mutate: (GridItem, List<GridItem>) -> Unit) {
         val pages = prefs.pages
         if (pages.isEmpty()) return
         val pageIndex = prefs.currentPageIndex.coerceIn(0, pages.size - 1)
-        val target = pages[pageIndex].items.firstOrNull {
+        val candidates = pages[pageIndex].items.filter {
             it.type == item.type && it.col == item.col && it.row == item.row
-        } ?: return
+        }
+        // Type and origin cell used to identify an item outright, because nothing could put two
+        // items of the same type on the same cell. Overlapping layouts can (drop one widget exactly
+        // onto another), and then acting on "the first match" would silently restack the wrong one -
+        // so the rest of the item's geometry breaks the tie when it does happen, with the original
+        // first-match as the fallback for the case it can't (two items identical in every respect,
+        // where either answer is the same answer).
+        val target = candidates.firstOrNull {
+            it.zIndex == item.zIndex && it.spanX == item.spanX && it.spanY == item.spanY
+        } ?: candidates.firstOrNull() ?: return
 
         mutate(target, pages[pageIndex].items)
         prefs.pages = pages
         pagerAdapter.notifyItemChanged(pageIndex)
-    }
-
-    /**
-     * The largest spanY, starting at [target]'s own row and capped at [desiredSpanY], that doesn't
-     * overlap another item's cells in [items] or run past [rowCount].
-     *
-     * HomeGridView's drag-resize (moveTouchListener/resizeTouchListener) rejects any target that
-     * overlaps another item outright - "no push/displace behavior". The settings dialogs' spanY
-     * changes don't go through that touch path, so without this they could silently grow one item's
-     * footprint over a neighbor's origin cell; rebuildChildren()'s occupied-cell skip then treats
-     * that neighbor as covered and stops rendering it (and its own cell listener) entirely, rather
-     * than the two items visibly overlapping. Clamping here keeps the same "reject growth past a
-     * neighbor" rule the drag path already enforces, just applied to a height that changes via a
-     * dialog instead of a finger.
-     */
-    private fun clampSpanYToOverlap(target: GridItem, items: List<GridItem>, desiredSpanY: Int, rowCount: Int): Int {
-        val occupied = mutableSetOf<Pair<Int, Int>>()
-        items.forEach { other ->
-            if (other === target) return@forEach
-            for (dx in 0 until other.spanX) {
-                for (dy in 0 until other.spanY) {
-                    occupied.add((other.col + dx) to (other.row + dy))
-                }
-            }
-        }
-        var span = 1
-        while (span < desiredSpanY && target.row + span < rowCount) {
-            val blocked = (0 until target.spanX).any { dx -> (target.col + dx) to (target.row + span) in occupied }
-            if (blocked) break
-            span++
-        }
-        return span.coerceIn(1, desiredSpanY)
     }
 
     /** The alignment radio button matching [alignment], for pre-selecting a settings dialog. */
@@ -977,6 +1041,31 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
         R.id.alignCenter -> Gravity.CENTER
         R.id.alignEnd -> Gravity.END
         else -> Gravity.START
+    }
+
+    /** The direction radio button matching [direction], for pre-selecting a settings dialog. */
+    private fun directionRadioId(direction: Int): Int = when (direction) {
+        LinearLayout.HORIZONTAL -> R.id.directionHorizontal
+        else -> R.id.directionVertical
+    }
+
+    /** The inverse of [directionRadioId] - LinearLayout.VERTICAL/HORIZONTAL, as GridItem.direction uses. */
+    private fun directionFor(checkedRadioButtonId: Int): Int = when (checkedRadioButtonId) {
+        R.id.directionHorizontal -> LinearLayout.HORIZONTAL
+        else -> LinearLayout.VERTICAL
+    }
+
+    /**
+     * Relabels the alignment RadioGroup's Start/End buttons (`alignStart`/`alignEnd`) to match
+     * [direction] - their `id`s and stored Gravity values never change, only the displayed text,
+     * kept in lockstep with HomeGridView's render-time gravity mapping for GridItem.alignment:
+     * Left/Right for a vertical list, Top/Bottom for a horizontal one. `alignCenter` reads "Center"
+     * either way and is left alone.
+     */
+    private fun relabelAlignmentButtons(content: DialogAppListSettingsBinding, direction: Int) {
+        val horizontal = direction == LinearLayout.HORIZONTAL
+        content.alignStart.setText(if (horizontal) R.string.top else R.string.left)
+        content.alignEnd.setText(if (horizontal) R.string.bottom else R.string.right)
     }
 
     /**
@@ -1261,7 +1350,14 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
                     // usually combine them. Step 9 had this same gesture remove the item outright;
                     // that action is now the delete badge inside edit mode, still with no
                     // confirmation dialog, so nothing became harder to reach.
-                    currentHomeGridView()?.enterEditMode(item)
+                    //
+                    // ...unless the item overlaps another one (plan 005 Step 7), where "which item
+                    // did you mean, and in what order should they stack?" has to be answerable
+                    // before anything else - so that case opens a menu instead. An item that
+                    // overlaps nothing has neither question and still goes straight into edit mode:
+                    // handleItemLongPress() is that fork, and for a non-overlapping item it is
+                    // exactly the enterEditMode(item) call this line used to make.
+                    currentHomeGridView()?.handleItemLongPress(item)
                 } else {
                     // Long-press on an empty cell used to go straight to Settings. HomeGridView
                     // tiles the whole screen with cells, so those cells always consume this
@@ -1367,18 +1463,31 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
     /**
      * Adds a new, all-empty App List item at the long-pressed cell (or the first cell it fits, same
      * rule startWidgetPicker's placement uses). Sized from the same defaults a new page's App List
-     * gets - one slot per grid row, so spanY == slot count, the invariant HomeGridView's row
-     * rendering assumes.
+     * gets - one slot per cell along [direction], so spanY == slot count for a vertical list (and
+     * spanX == slot count for a horizontal one), the invariant HomeGridView's rendering assumes; the
+     * other span comes from the grid.
+     *
+     * [direction] is [LinearLayout.VERTICAL] for every caller today (GridItem's own default); the
+     * parameter exists so a horizontal list can be created without re-deriving its geometry here.
      */
-    private fun addAppList(col: Int, row: Int) {
+    private fun addAppList(col: Int, row: Int, direction: Int = LinearLayout.VERTICAL) {
         val pages = prefs.pages
         if (pages.isEmpty()) return
         val pageIndex = prefs.currentPageIndex.coerceIn(0, pages.size - 1)
         val page = pages[pageIndex]
 
         val (columnCount, rowCount) = gridGeometry()
-        val spanX = defaultAppListSpanX(columnCount)
-        val spanY = defaultAppListSpanY(DEFAULT_APP_LIST_SLOT_COUNT).coerceAtMost(rowCount.coerceAtLeast(1))
+        val horizontal = direction == LinearLayout.HORIZONTAL
+        val spanX = if (horizontal) {
+            defaultAppListSpanXForSlots(DEFAULT_APP_LIST_SLOT_COUNT).coerceAtMost(columnCount.coerceAtLeast(1))
+        } else {
+            defaultAppListSpanX(columnCount)
+        }
+        val spanY = if (horizontal) {
+            defaultAppListSpanYForGrid(rowCount)
+        } else {
+            defaultAppListSpanY(DEFAULT_APP_LIST_SLOT_COUNT).coerceAtMost(rowCount.coerceAtLeast(1))
+        }
         val position = firstFreePosition(page.items, col, row, spanX, spanY, columnCount, rowCount)
 
         val updatedItems = page.items.toMutableList()
@@ -1389,8 +1498,11 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
                 row = position.second,
                 spanX = spanX,
                 spanY = spanY,
+                // New item the user just added: lands on top of everything else on the page.
+                zIndex = (page.items.maxOfOrNull { it.zIndex } ?: -1) + 1,
                 appSlots = MutableList(DEFAULT_APP_LIST_SLOT_COUNT) { AppSlot() },
                 alignment = Gravity.START,
+                direction = direction,
             )
         )
         val updatedPages = pages.toMutableList()
@@ -1423,6 +1535,8 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
                 row = position.second,
                 spanX = spanX,
                 spanY = spanY,
+                // New item the user just added: lands on top of everything else on the page.
+                zIndex = (page.items.maxOfOrNull { it.zIndex } ?: -1) + 1,
                 alignment = Gravity.START,
             )
         )
@@ -1456,6 +1570,8 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
                 row = position.second,
                 spanX = spanX,
                 spanY = spanY,
+                // New item the user just added: lands on top of everything else on the page.
+                zIndex = (page.items.maxOfOrNull { it.zIndex } ?: -1) + 1,
                 alignment = Gravity.START,
                 showScreenTime = false,
                 // Dead field, kept only because it has to hold some value - a DATE_TIME item's date
@@ -1523,6 +1639,8 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
                 row = position.second,
                 spanX = spanX,
                 spanY = spanY,
+                // New item the user just added: lands on top of everything else on the page.
+                zIndex = (page.items.maxOfOrNull { it.zIndex } ?: -1) + 1,
                 appWidgetId = appWidgetId,
             )
         )
@@ -1616,10 +1734,5 @@ class HomeFragment : BaseFragment(), View.OnClickListener, View.OnLongClickListe
         /** Side padding around a dialog's text input, matching PagesSettingsFragment's. */
         private const val RENAME_DIALOG_PADDING_DP = 20
 
-        // Range of the App List settings dialog's slot-count stepper. One slot is the smallest
-        // thing still worth calling a list; eight matches the launcher's long-standing home-app
-        // count (Prefs' appUser1..8 storage shape) and keeps a full-width list inside one screen.
-        private const val MIN_APP_LIST_SLOT_COUNT = 1
-        private const val MAX_APP_LIST_SLOT_COUNT = 8
     }
 }

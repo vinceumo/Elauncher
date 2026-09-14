@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.res.Configuration
 import android.content.res.Resources
 import android.view.Gravity
+import android.widget.LinearLayout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
@@ -79,6 +80,9 @@ class AppListMigrationTest {
             assertEquals(original.spanX, converted.spanX)
             assertEquals(original.spanY, converted.spanY)
             assertEquals(Gravity.START, converted.alignment)
+            // GridItem(...) is constructed without specifying direction, so migrated App Lists get
+            // Step 1's default - vertical, same as every pre-direction App List rendered before.
+            assertEquals(LinearLayout.VERTICAL, converted.direction)
             val slot = converted.appSlots.single()
             assertEquals(original.appName, slot.appName)
             assertEquals(original.appPackage, slot.appPackage)

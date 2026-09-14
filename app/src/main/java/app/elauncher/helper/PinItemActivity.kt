@@ -95,6 +95,8 @@ class PinItemActivity : AppCompatActivity() {
                 row = 0,
                 spanX = spanFor(info?.minWidth),
                 spanY = spanFor(info?.minHeight),
+                // New item being added to the page: lands on top of everything else on it.
+                zIndex = (page.items.maxOfOrNull { it.zIndex } ?: -1) + 1,
                 appWidgetId = appWidgetId,
             )
         )

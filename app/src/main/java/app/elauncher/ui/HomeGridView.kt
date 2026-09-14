@@ -25,6 +25,8 @@ import app.elauncher.data.AppSlot
 import app.elauncher.data.Constants
 import app.elauncher.data.GridItem
 import app.elauncher.data.GridItemType
+import app.elauncher.data.coversCell
+import app.elauncher.data.overlaps
 import app.elauncher.helper.FontManager
 import app.elauncher.helper.WidgetHostManager
 import app.elauncher.helper.dpToPx
@@ -41,9 +43,9 @@ import kotlin.math.roundToInt
  * This view does not touch Prefs or navigation, and it does not detect the *normal* (non-editing)
  * gestures itself: today's codebase resolves tap/long-press/swipe together per-view via a single
  * GestureDetector-based View.OnTouchListener (see HomeFragment.getViewSwipeTouchListener), and there
- * is no touch-event-propagation-to-parent mechanism for swipes to inherit here. So every cell -
- * occupied or empty - gets its entire touch handling delegated to a listener supplied by the caller
- * via [setItems].
+ * is no touch-event-propagation-to-parent mechanism for swipes to inherit here. So every item, and
+ * every cell no item covers, gets its entire touch handling delegated to a listener supplied by the
+ * caller via [setItems].
  *
  * The one exception is *edit mode* (Step 19): once [enterEditMode] is called for an item, this view
  * takes over touch handling for the whole grid until edit mode ends, because move/resize are
@@ -88,6 +90,14 @@ class HomeGridView @JvmOverloads constructor(
     private var onItemDeleted: ((GridItem) -> Unit)? = null
     private var onOpenSettings: ((GridItem) -> Unit)? = null
 
+    /**
+     * Shows the long-press menu for an item that overlaps another one (plan 005 Step 7) - stacking
+     * order, plus the actions edit mode already offers. Caller-owned like every other callback here:
+     * this view decides *that* the menu is the right response ([handleItemLongPress]), the fragment
+     * owns what a dialog looks like.
+     */
+    private var onStackedItemLongPress: ((GridItem) -> Unit)? = null
+
     // DATE_TIME rendering/wiring - all caller-owned for the same reason touchListenerFor etc. are
     // (this view touches no Prefs/Context helpers): dateTextProvider/screenTimeTextProvider supply
     // the already-formatted text (HomeFragment's preserved formatDateText()/currentScreenTimeText(),
@@ -104,6 +114,26 @@ class HomeGridView @JvmOverloads constructor(
     /** The item currently being edited, identified by reference into [items]. Null when not editing. */
     private var editingItem: GridItem? = null
     private var editingItemView: View? = null
+
+    // Tap-cycling state (plan 005 Step 4) - see [trackTapForCycling] and [cycleSelection].
+    private var lastTapPoint: TapPoint? = null
+    private var tapCycleIndex: Int = 0
+    private var tapSelectedItem: GridItem? = null
+
+    // The in-flight gesture being classified as tap-or-not by [trackTapForCycling].
+    private var gestureDownPoint: TapPoint? = null
+    private var gestureDownTimeMs: Long = 0L
+    private var gestureDisqualified: Boolean = false
+
+    /**
+     * The view [rebuildChildren] built for each item, in add order, so [viewForItem] can answer
+     * "which child is this item's?" by identity.
+     *
+     * Pairs rather than a Map because the key has to be compared by reference: [GridItem] is a data
+     * class, so two items that happen to hold the same values (two empty 1x1 App Lists, say) are
+     * equal and would collide in a Map. Rebuilt from scratch on every [rebuildChildren].
+     */
+    private val itemViews = mutableListOf<Pair<GridItem, View>>()
 
     /**
      * The widget ids that still had a live provider at the last [rebuildChildren] - i.e. the cells
@@ -127,10 +157,11 @@ class HomeGridView @JvmOverloads constructor(
     private var overlayView: View? = null
 
     /**
-     * Clears and re-adds one child view per occupied cell plus one invisible/transparent view
-     * per unoccupied cell (so empty cells are addressable too). [touchListenerFor] is called
-     * for every cell, occupied or empty, and its result is set via [View.setOnTouchListener] -
-     * this view has no click/long-click/swipe logic of its own.
+     * Clears and re-adds one child view per item - absolutely positioned at the item's own pixel
+     * bounds, stacked by [GridItem.zIndex] (see [rebuildChildren]) - plus one invisible/transparent
+     * view per cell no item covers (so empty cells are addressable too). [touchListenerFor] is
+     * called for every one of those, item or empty cell, and its result is set via
+     * [View.setOnTouchListener] - this view has no click/long-click/swipe logic of its own.
      *
      * An App List item's rows are addressable individually rather than as one cell, so
      * [slotTouchListenerFor] supplies the same kind of caller-owned gesture listener per slot -
@@ -154,6 +185,7 @@ class HomeGridView @JvmOverloads constructor(
         onItemsChanged: ((List<GridItem>) -> Unit)? = null,
         onItemDeleted: ((GridItem) -> Unit)? = null,
         onOpenSettings: ((GridItem) -> Unit)? = null,
+        onStackedItemLongPress: ((GridItem) -> Unit)? = null,
         dateTextProvider: (() -> String)? = null,
         screenTimeTextProvider: (() -> String?)? = null,
         onClockClick: (() -> Unit)? = null,
@@ -168,6 +200,7 @@ class HomeGridView @JvmOverloads constructor(
         this.onItemsChanged = onItemsChanged
         this.onItemDeleted = onItemDeleted
         this.onOpenSettings = onOpenSettings
+        this.onStackedItemLongPress = onStackedItemLongPress
         this.dateTextProvider = dateTextProvider
         this.screenTimeTextProvider = screenTimeTextProvider
         this.onClockClick = onClockClick
@@ -178,12 +211,68 @@ class HomeGridView @JvmOverloads constructor(
         // read), so an item being edited can't survive a rebind - drop edit mode rather than
         // silently editing a detached copy.
         editingItem = editingItem?.let { editing -> items.firstOrNull { it === editing } }
+        // Same reasoning one line up, for the tap-cycle selection: it points into the *old* list, so
+        // a rebind (a different page on a recycled view, or this page re-read from Prefs) leaves it
+        // pointing at an instance no longer on screen.
+        resetTapCycle()
         rebuildChildren()
     }
 
     fun columnCount(): Int = columnCount
 
     fun rowCount(): Int = rowCount
+
+    /**
+     * Whether [item]'s footprint intersects any *other* item on this page.
+     *
+     * This is what decides whether a long press on [item] gets the stacking menu or goes straight
+     * into edit mode as it always has ([handleItemLongPress], plan 005 Step 7): an item sitting on
+     * its own has no stacking question to answer, so it must not pay for one.
+     *
+     * Only ever false for an item that isn't on this page at all - which reads correctly anyway
+     * ("nothing here overlaps it").
+     */
+    private fun overlapsAnotherItem(item: GridItem): Boolean =
+        items.any { other -> other !== item && other.overlaps(item.col, item.row, item.spanX, item.spanY) }
+
+    /**
+     * What a long press on [pressed] does: the stacking menu for an item that overlaps another one,
+     * and edit mode directly - exactly as before plan 005 Step 7 - for one that doesn't.
+     *
+     * Entered from both long-press routes an item has, so the rule is stated once: the per-cell
+     * gesture listener the caller supplies (HomeFragment.cellTouchListenerFor) for most items, and
+     * [WidgetCellContainer]'s own timer for a hosted widget, whose content would otherwise swallow
+     * the gesture before any listener of ours saw it.
+     *
+     * Falls back to edit mode if no menu callback was supplied, so a caller that wires nothing up
+     * keeps the old behaviour rather than a long press doing nothing at all.
+     */
+    fun handleItemLongPress(pressed: GridItem) {
+        val target = longPressTarget(pressed)
+        val showMenu = onStackedItemLongPress
+        if (showMenu != null && overlapsAnotherItem(target)) showMenu(target) else enterEditMode(target)
+    }
+
+    /**
+     * Which item a long press on [pressed] is actually about.
+     *
+     * Normally [pressed] itself - but where items overlap, the one whose view receives the gesture
+     * is always the topmost, and the user may have tapped their way down the stack to single out one
+     * underneath it ([tapSelectedItem]). That selection wins when it is about the same stack, which
+     * is the only way an item buried under another can be acted on at all.
+     *
+     * "The same stack" is checked rather than assumed: a selection survives until the next tap, so a
+     * long press on an unrelated item elsewhere on the page - with no tap in between - would
+     * otherwise silently act on whatever was singled out somewhere else. A selection that neither is
+     * nor touches [pressed] is therefore ignored, as is a null one (no tap yet, or the tap missed),
+     * leaving the long press to mean exactly what it did before.
+     */
+    private fun longPressTarget(pressed: GridItem): GridItem {
+        val selected = tapSelectedItem() ?: return pressed
+        val sameStack = selected === pressed ||
+            selected.overlaps(pressed.col, pressed.row, pressed.spanX, pressed.spanY)
+        return if (sameStack) selected else pressed
+    }
 
     /**
      * Selects [item] for editing: it gets a highlighted outline, resize handles (subject to the
@@ -195,6 +284,7 @@ class HomeGridView @JvmOverloads constructor(
         if (items.none { it === item }) return
         if (editingItem === item) return
         removeEditChrome()
+        resetTapCycle()
         editingItem = item
         if (clampToGrid(item)) {
             // The item didn't fit the grid before the user ever touched it, so every move/resize
@@ -309,6 +399,26 @@ class HomeGridView @JvmOverloads constructor(
         gridOffsetY = ((height - rowCount * cellSizePx) / 2).coerceAtLeast(0)
     }
 
+    /**
+     * Rebuilds the whole grid: one 1x1 filler view per *empty* cell, then one view per [GridItem],
+     * each absolutely positioned at its own pixel bounds.
+     *
+     * One view per item, not one per cell. The previous shape - walk every cell row-major, look the
+     * item up by its origin cell, skip any cell some item's span already covered - could only ever
+     * express a layout where no two items touch: a second item whose origin fell inside another's
+     * span had its cell skipped and so never rendered at all, silently. Positioning each item
+     * independently ([cellParams], pixel bounds from [gridBounds]) drops that constraint entirely,
+     * which is what lets two items overlap and both still be on screen.
+     *
+     * Add order is the stacking order. Android draws children in add order and dispatches touches in
+     * the reverse of it, so items are added sorted by [GridItem.zIndex] ascending: the highest
+     * zIndex is added last, paints on top, and is offered the touch first. Empty-cell fillers go in
+     * before any item (they are the backdrop, and by construction no item covers them). The
+     * edit-mode chrome is added after everything, so it stays above the lot.
+     *
+     * [touchListenerFor] is still called once per rendered thing - for an item with its own origin
+     * cell, for a filler with its cell - so the caller's gesture wiring is unchanged.
+     */
     private fun rebuildChildren() {
         val touchListenerFor = this.touchListenerFor ?: return
         if (columnCount <= 0 || rowCount <= 0) return
@@ -321,40 +431,36 @@ class HomeGridView @JvmOverloads constructor(
         previewView = null
         overlayView = null
         editingItemView = null
+        itemViews.clear()
         liveWidgetIds = currentLiveWidgetIds()
-
-        val itemsByCell = mutableMapOf<Pair<Int, Int>, GridItem>()
-        items.forEach { item -> itemsByCell[item.col to item.row] = item }
 
         // Cell labels are built in code, never inflated from XML, and are rebuilt on every
         // setItems()/resize - so the fragment-level typeface walk can't reach them and each cell
         // applies the custom font itself. Resolved once per rebuild rather than per cell.
         val customTypeface = FontManager.activeCustomTypeface(context)
 
-        val occupiedByOtherCell = mutableSetOf<Pair<Int, Int>>()
-        items.forEach { item ->
-            for (dx in 0 until item.spanX) {
-                for (dy in 0 until item.spanY) {
-                    if (dx == 0 && dy == 0) continue
-                    occupiedByOtherCell.add((item.col + dx) to (item.row + dy))
-                }
+        // Empty cells stay individually addressable (long-pressing one is the only route to the
+        // "add a widget / open settings" menu), so each one still gets its own transparent 1x1 view.
+        // "Empty" is now asked of the items directly - no item's footprint contains this cell -
+        // rather than read out of a cell-keyed occupancy map, which an overlapping layout can't
+        // build in the first place.
+        for (row in 0 until rowCount) {
+            for (col in 0 until columnCount) {
+                if (items.any { it.coversCell(col, row) }) continue
+                val cellView = createCellView(null, customTypeface)
+                cellView.setOnTouchListener(touchListenerFor(col, row, null))
+                addView(cellView, cellParams(col, row, 1, 1))
             }
         }
 
-        for (row in 0 until rowCount) {
-            for (col in 0 until columnCount) {
-                val cell = col to row
-                if (cell in occupiedByOtherCell) continue // covered by another item's span
-
-                val item = itemsByCell[cell]
-                val cellView = createCellView(item, customTypeface)
-                cellView.setOnTouchListener(touchListenerFor(col, row, item))
-                if (item != null && item === editingItem) editingItemView = cellView
-
-                val spanX = item?.spanX ?: 1
-                val spanY = item?.spanY ?: 1
-                addView(cellView, cellParams(col, row, spanX, spanY))
-            }
+        // sortedBy is stable, so items that tie on zIndex keep their stored order - which is the
+        // order Prefs' one-time backfill gave them their indices in.
+        items.sortedBy { it.zIndex }.forEach { item ->
+            val itemView = createCellView(item, customTypeface)
+            itemView.setOnTouchListener(touchListenerFor(item.col, item.row, item))
+            itemViews.add(item to itemView)
+            if (item === editingItem) editingItemView = itemView
+            addView(itemView, cellParams(item.col, item.row, item.spanX, item.spanY))
         }
 
         if (editingItem != null) addEditChrome()
@@ -399,14 +505,22 @@ class HomeGridView @JvmOverloads constructor(
     }
 
     /**
-     * A vertical stack of one row per [GridItem.appSlots] entry - `item.appSlots.size` is expected
-     * to equal `item.spanY` (an invariant the settings dialog and picking flow are responsible for
-     * maintaining, not something enforced defensively here). Each row is its own [TextView], sized
-     * with `layout_weight = 1` so the stack divides the cell view's height evenly no matter how many
-     * rows there are, which composes with the outer cell's own `spanY * cellSizePx` sizing without
-     * this view needing to know [cellSizePx] itself.
+     * A stack of one slot per [GridItem.appSlots] entry, laid out along [GridItem.direction]: a
+     * vertical list is one row per slot (today's shape), a horizontal one is one column per slot.
+     * `item.appSlots.size` is *not* tied to `item.spanY`/`item.spanX` - the settings dialog's
+     * stepper ([app.elauncher.data.resizeAppSlots]) is the only thing that changes slot count, and
+     * only picks a starting span for whichever axis is currently the content one; a later drag is
+     * free to move that axis away from the slot count entirely, same as the cross axis always could.
+     * So the two are expected to *diverge* in normal use, not stay equal - this view just divides
+     * whatever span it's given into `appSlots.size` equal-weight slots along [GridItem.direction],
+     * however many cells that turns out to span. Each slot is its own [TextView], sized
+     * with `layout_weight = 1` along the list's direction so the stack divides the cell view's
+     * height (vertical) or width (horizontal) evenly no matter how many slots there are, which
+     * composes with the outer cell's own `spanY * cellSizePx` / `spanX * cellSizePx` sizing without
+     * this view needing to know [cellSizePx] itself. The cross axis is MATCH_PARENT, so it fills
+     * whatever the user resized that axis to rather than assuming anything about slot count.
      *
-     * Row text, in order of preference: [AppSlot.customLabel], else [AppSlot.appName], else the
+     * Slot text, in order of preference: [AppSlot.customLabel], else [AppSlot.appName], else the
      * "App" placeholder for an empty slot ([AppSlot.appPackage] == null).
      *
      * Each row carries its own gesture listener from `slotTouchListenerFor` (Step 9), so a tap or
@@ -422,7 +536,22 @@ class HomeGridView @JvmOverloads constructor(
      */
     private fun createAppListView(item: GridItem, customTypeface: Typeface?): View =
         LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
+            val horizontal = item.direction == LinearLayout.HORIZONTAL
+            orientation = item.direction
+            // The same stored GridItem.alignment means a different gravity depending on the list's
+            // direction: Start/Center/End across a vertical list's rows, Top/Middle/Bottom down a
+            // horizontal list's columns. Nothing about the stored values changes - only how they're
+            // applied here. The settings dialog relabels its (unchanged) Start/Center/End radio
+            // buttons to Top/Middle/Bottom for a horizontal list, so what the user picks matches
+            // what they see; that relabelling and this mapping have to agree or the buttons lie.
+            // Anything unrecognised is treated as the Center choice, as alignmentRadioId already
+            // does - and Center is stored as Gravity.CENTER (HomeFragment.alignmentFor), with the
+            // literal Gravity.CENTER_HORIZONTAL only reaching here from older-written items.
+            val slotGravity = when (item.alignment) {
+                Gravity.START -> if (horizontal) Gravity.TOP else Gravity.START
+                Gravity.END -> if (horizontal) Gravity.BOTTOM else Gravity.END
+                else -> if (horizontal) Gravity.CENTER_VERTICAL else Gravity.CENTER
+            }
             item.appSlots.forEachIndexed { slotIndex, slot ->
                 addView(
                     TextView(context).apply {
@@ -430,12 +559,16 @@ class HomeGridView @JvmOverloads constructor(
                         text = slot.customLabel ?: slot.appName ?: context.getString(R.string.app)
                         ellipsize = android.text.TextUtils.TruncateAt.END
                         isSingleLine = true
-                        gravity = item.alignment
+                        gravity = slotGravity
                         if (isAppSlotUnavailable?.invoke(slot) == true) alpha = UNAVAILABLE_SLOT_ALPHA
                         if (customTypeface != null) setTypeface(customTypeface, typeface?.style ?: Typeface.NORMAL)
                         slotTouchListenerFor?.let { setOnTouchListener(it(item, slotIndex)) }
                     },
-                    LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+                    if (horizontal) {
+                        LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+                    } else {
+                        LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+                    }
                 )
             }
         }
@@ -573,7 +706,13 @@ class HomeGridView @JvmOverloads constructor(
         private val longPressCheck = Runnable {
             pending = false
             triggered = true
-            enterEditMode(item)
+            // Not enterEditMode() directly any more: a widget stacked with another item gets the
+            // same long-press menu every other item type does (plan 005 Step 7). This timer is the
+            // only long press a hosted widget has - its own content consumes the gesture before the
+            // cell's listener, and therefore before HomeFragment, ever sees it - so routing it
+            // through the shared decision is what makes the menu reachable on a widget at all. An
+            // unstacked widget still lands straight in edit mode, via the same call as before.
+            handleItemLongPress(item)
         }
 
         override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
@@ -667,20 +806,155 @@ class HomeGridView @JvmOverloads constructor(
             }
         }
 
+    // region tap cycling
+
+    /**
+     * The item the user's taps have currently singled out of an overlapping stack, or null if the
+     * last tap hit nothing (or there has been no tap since the last reset).
+     *
+     * This is what "which of these overlapping items does the user mean?" resolves to, for whoever
+     * needs to act on a selection - the long-press menu of a later step, primarily. Nothing acts on
+     * it yet; this step only makes it answerable.
+     *
+     * Re-checked against [items] by identity on every read rather than trusted: the state is
+     * deliberately cleared on every rebind ([setItems]), but an item can also disappear from under
+     * it within one bind (the edit-mode delete badge), and a selection pointing at an item no
+     * longer on the page must read as "nothing selected", not as a stale reference.
+     */
+    fun tapSelectedItem(): GridItem? =
+        tapSelectedItem?.takeIf { selected -> items.any { it === selected } }
+
+    /**
+     * Forgets which item the taps so far had singled out, so the next tap starts again from the top
+     * of whatever stack it lands on.
+     *
+     * Called whenever the thing the cycle was counting through stops being what the user is looking
+     * at: a page rebind ([setItems] - new [GridItem] instances, possibly a different page entirely)
+     * and entering edit mode (the selection is now the edited item, and edit mode's own chrome
+     * swallows every touch anyway). A tap somewhere else resets it too, but that is [cycleSelection]'s
+     * own rule rather than an explicit call.
+     */
+    private fun resetTapCycle() {
+        lastTapPoint = null
+        tapCycleIndex = 0
+        tapSelectedItem = null
+    }
+
+    /**
+     * Observes the whole page's touch stream purely to spot stationary taps, without taking part in
+     * dispatch: [super.dispatchTouchEvent]'s result is returned untouched, so which child actually
+     * handles a gesture is entirely unaffected by this.
+     *
+     * Observing *here* rather than from a child's OnTouchListener is what makes the cycling
+     * reachable at all. A touch on an item is consumed by the topmost view under the finger and
+     * never offered to anything below it - a hosted widget's own RemoteViews content, an App List
+     * row, or [WidgetCellContainer], each of which would only ever report taps on itself.
+     * dispatchTouchEvent is above all of them, so it sees a tap on the stack regardless of which
+     * layer ends up consuming it, and needs no cooperation from any of them.
+     */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        trackTapForCycling(ev)
+        return super.dispatchTouchEvent(ev)
+    }
+
+    /**
+     * Classifies the in-flight gesture and, when it turns out to be a plain stationary tap, advances
+     * the selection cycle for the stack under it.
+     *
+     * "A tap" here is down-then-up with no movement past [touchSlopPx] - the same threshold
+     * [moveTouchListener] and [WidgetCellContainer] use to call something a drag - and short enough
+     * not to be a long press. Both exclusions matter:
+     * - **Drags** must not cycle: a page swipe, a widget's own scroll or an edit-mode move would
+     *   otherwise silently advance the selection every time the user's finger lifted.
+     * - **Long presses** must not cycle either, and are excluded by [widgetLongPressTimeoutMs], the
+     *   same delay after which a press is treated as a long press everywhere else here. A long press
+     *   is stationary too, and is precisely the gesture that *acts* on the current selection - so
+     *   advancing the cycle as its finger lifts would leave the state one step past what the user
+     *   was just shown.
+     *
+     * A second finger disqualifies the gesture outright: a multi-touch stream has no single "the"
+     * tap point to cycle around.
+     */
+    private fun trackTapForCycling(ev: MotionEvent) {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                gestureDownPoint = TapPoint(ev.x.roundToInt(), ev.y.roundToInt())
+                gestureDownTimeMs = ev.eventTime
+                gestureDisqualified = editingItem != null
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                val down = gestureDownPoint ?: return
+                val here = TapPoint(ev.x.roundToInt(), ev.y.roundToInt())
+                if (!here.isWithin(touchSlopPx, down)) gestureDisqualified = true
+            }
+
+            MotionEvent.ACTION_POINTER_DOWN -> gestureDisqualified = true
+
+            MotionEvent.ACTION_UP -> {
+                val down = gestureDownPoint
+                gestureDownPoint = null
+                if (down == null || gestureDisqualified) return
+                if (ev.eventTime - gestureDownTimeMs >= widgetLongPressTimeoutMs) return
+                val up = TapPoint(ev.x.roundToInt(), ev.y.roundToInt())
+                if (!up.isWithin(touchSlopPx, down)) return
+                onTapForCycling(down)
+            }
+
+            MotionEvent.ACTION_CANCEL -> gestureDownPoint = null
+        }
+    }
+
+    /**
+     * Advances (or restarts) the cycle for the stack of items under [point], keyed off the *down*
+     * position rather than the up one so the anchor can't drift a slop's width per tap.
+     */
+    private fun onTapForCycling(point: TapPoint) {
+        val result = cycleSelection(
+            candidates = itemsAt(point),
+            tapPoint = point,
+            previousTapPoint = lastTapPoint,
+            previousCycleIndex = tapCycleIndex,
+            touchSlopPx = touchSlopPx,
+        )
+        lastTapPoint = point
+        tapCycleIndex = result.index
+        tapSelectedItem = result.selected
+    }
+
+    /**
+     * Every item whose footprint contains [point], in stored order (the sort into stacking order is
+     * [cycleSelection]'s job).
+     *
+     * Resolved through the grid cell the point falls in rather than by comparing pixel rectangles:
+     * every item's footprint is whole cells by construction, so the two are equivalent, and going
+     * via [coversCell] keeps one definition of "does this item cover that" shared with rendering.
+     * A point in the leftover margin outside the whole-cell grid ([gridOffsetX]/[gridOffsetY])
+     * belongs to no cell and so covers nothing.
+     */
+    private fun itemsAt(point: TapPoint): List<GridItem> {
+        if (cellSizePx <= 0 || columnCount <= 0 || rowCount <= 0) return emptyList()
+        if (point.x < gridOffsetX || point.y < gridOffsetY) return emptyList()
+        val col = (point.x - gridOffsetX) / cellSizePx
+        val row = (point.y - gridOffsetY) / cellSizePx
+        if (col >= columnCount || row >= rowCount) return emptyList()
+        return items.filter { it.coversCell(col, row) }
+    }
+
+    // endregion
+
     // region edit mode
 
-    private fun viewForItem(item: GridItem): View? {
-        for (index in 0 until childCount) {
-            val child = getChildAt(index)
-            val params = child.layoutParams as? LayoutParams ?: continue
-            if (params.leftMargin == gridOffsetX + item.col * cellSizePx &&
-                params.topMargin == gridOffsetY + item.row * cellSizePx
-            ) {
-                return child
-            }
-        }
-        return null
-    }
+    /**
+     * The child view [rebuildChildren] built for [item], or null if it hasn't been rebuilt since.
+     *
+     * Looked up by item identity through [itemViews]. It used to be found by matching a child's
+     * left/top margins against the item's cell origin, which stops being an identifying property the
+     * moment two items are allowed to overlap - two items sharing an origin would both match, and
+     * the first hit (which could equally be a full-bleed piece of edit chrome at margin 0) won.
+     */
+    private fun viewForItem(item: GridItem): View? =
+        itemViews.firstOrNull { (candidate, _) -> candidate === item }?.second
 
     private fun removeEditChrome() {
         scrimView?.let { removeView(it) }
@@ -728,11 +1002,21 @@ class HomeGridView @JvmOverloads constructor(
         overlayView = overlay
     }
 
-    private fun cellParams(col: Int, row: Int, spanX: Int, spanY: Int): LayoutParams =
-        LayoutParams(spanX * cellSizePx, spanY * cellSizePx).apply {
-            leftMargin = gridOffsetX + col * cellSizePx
-            topMargin = gridOffsetY + row * cellSizePx
+    /**
+     * Absolute placement of a whole-cell range inside this view, as FrameLayout params: an explicit
+     * pixel size plus left/top margins, which for a FrameLayout child with the default (top|start)
+     * gravity is simply "put it here". Every positioned child goes through this - each item's own
+     * view, the edit-mode selection overlay and the snap preview - so they cannot drift apart.
+     *
+     * The arithmetic itself lives in [gridBounds] (GridGeometry.kt), which is pure and unit-tested.
+     */
+    private fun cellParams(col: Int, row: Int, spanX: Int, spanY: Int): LayoutParams {
+        val bounds = gridBounds(col, row, spanX, spanY, cellSizePx, gridOffsetX, gridOffsetY)
+        return LayoutParams(bounds.width, bounds.height).apply {
+            leftMargin = bounds.left
+            topMargin = bounds.top
         }
+    }
 
     /**
      * Draws the boundary of every cell across the whole grid (not just occupied ones) for the
@@ -864,8 +1148,12 @@ class HomeGridView @JvmOverloads constructor(
      * WIDGET - a hosted widget's settings belong to its provider, not to us - and for the legacy
      * APP type, which no longer renders or gets created at all (Step 6/9); the branch is kept so
      * this stays total over the enum rather than relying on an else.
+     *
+     * Public rather than private since Step 7: the long-press stacking menu offers the same
+     * "Settings" action *before* edit mode is entered, and must offer it on exactly the items that
+     * would get a badge inside it - so it asks this rather than keeping a second copy of the rule.
      */
-    private fun hasSettings(item: GridItem): Boolean = when (item.type) {
+    fun hasSettings(item: GridItem): Boolean = when (item.type) {
         GridItemType.APP_LIST, GridItemType.DATE_TIME -> true
         // CLOCK has settings too - alignment, and only alignment
         // (HomeFragment.showClockSettings).
@@ -892,8 +1180,12 @@ class HomeGridView @JvmOverloads constructor(
     /**
      * Drag anywhere on the item to reposition it: the item and its overlay follow the finger, while
      * the snap preview shows the whole-cell target the release would commit to. Nothing is written
-     * until ACTION_UP, and a target that leaves the grid or overlaps another item is rejected, so
-     * the item simply snaps back to where it started (no push/displace behavior - see Step 19).
+     * until ACTION_UP, and only a target that leaves the grid is rejected, so an out-of-bounds drop
+     * snaps the item back to where it started.
+     *
+     * Dropping onto another item is *not* rejected: the two simply overlap, stacked by
+     * [GridItem.zIndex]. Nothing is pushed aside to make room either (no push/displace behavior -
+     * see Step 19); the item lands exactly where it was released.
      */
     private fun moveTouchListener(item: GridItem): OnTouchListener {
         var downX = 0f
@@ -928,7 +1220,7 @@ class HomeGridView @JvmOverloads constructor(
                         targetRow = snapSpan(item.row * cellSizePx + dy, rowCount - item.spanY)
                         showPreview(
                             targetCol, targetRow, item.spanX, item.spanY,
-                            fits(item, targetCol, targetRow, item.spanX, item.spanY)
+                            fits(item, targetCol, targetRow, item.spanX, item.spanY, allowOverlap = true)
                         )
                     }
                     true
@@ -957,8 +1249,8 @@ class HomeGridView @JvmOverloads constructor(
     /**
      * Drag the end/bottom grip to change [GridItem.spanX]/[GridItem.spanY] in whole-cell steps.
      * The item itself stays put while dragging; only the snap preview grows/shrinks, which keeps a
-     * hosted widget from being remeasured on every touch move. Same commit-on-release and
-     * reject-on-overlap rules as a move.
+     * hosted widget from being remeasured on every touch move. Same commit-on-release rules as a
+     * move: only a span that runs off the grid is refused, growing over a neighbour is not.
      */
     private fun resizeTouchListener(item: GridItem, horizontal: Boolean): OnTouchListener {
         var down = 0f
@@ -996,7 +1288,7 @@ class HomeGridView @JvmOverloads constructor(
                         }
                         showPreview(
                             item.col, item.row, targetSpanX, targetSpanY,
-                            fits(item, item.col, item.row, targetSpanX, targetSpanY)
+                            fits(item, item.col, item.row, targetSpanX, targetSpanY, allowOverlap = true)
                         )
                     }
                     true
@@ -1023,24 +1315,34 @@ class HomeGridView @JvmOverloads constructor(
     private fun clampSpan(rawSpan: Float, min: Int, max: Int): Int =
         rawSpan.roundToInt().coerceIn(min, maxOf(min, max))
 
-    /** True if [item] at the given position/span stays on the grid and touches no other item. */
-    private fun fits(item: GridItem, col: Int, row: Int, spanX: Int, spanY: Int): Boolean {
-        if (col < 0 || row < 0 || spanX < 1 || spanY < 1) return false
-        if (col + spanX > columnCount || row + spanY > rowCount) return false
-        return items.none { other ->
-            other !== item &&
-                col < other.col + other.spanX && other.col < col + spanX &&
-                row < other.row + other.spanY && other.row < row + spanY
-        }
-    }
+    /**
+     * True if [item] at the given position/span is a legal target on this grid - see [fitsOnGrid]
+     * for the two rules and which of them [allowOverlap] lifts.
+     *
+     * Every caller here is a user's own drag and passes true: dropping a widget on top of another
+     * one is a thing the user is allowed to ask for. The strict default is what the placement
+     * helpers that position an item *for* the user use (Page.kt's firstFreePosition and friends,
+     * which reach the same rules through [app.elauncher.data.overlaps] rather than through this).
+     */
+    private fun fits(
+        item: GridItem,
+        col: Int,
+        row: Int,
+        spanX: Int,
+        spanY: Int,
+        allowOverlap: Boolean = false,
+    ): Boolean = fitsOnGrid(item, col, row, spanX, spanY, items, columnCount, rowCount, allowOverlap)
 
     /**
      * Applies a move/resize if it is legal, and does nothing at all if it isn't - the caller has
      * already reset the dragged views' translation, so a rejected drag reads as "snapped back".
+     *
+     * Only ever called from the drag listeners, so overlap is allowed and "illegal" means "off the
+     * grid" and nothing else.
      */
     private fun commitGeometry(item: GridItem, col: Int, row: Int, spanX: Int, spanY: Int) {
         if (col == item.col && row == item.row && spanX == item.spanX && spanY == item.spanY) return
-        if (!fits(item, col, row, spanX, spanY)) return
+        if (!fits(item, col, row, spanX, spanY, allowOverlap = true)) return
 
         item.col = col
         item.row = row
@@ -1050,8 +1352,8 @@ class HomeGridView @JvmOverloads constructor(
         if (item.type == GridItemType.WIDGET) notifyWidgetResized(item)
 
         // Move the already-attached views straight away so the commit is visible on this frame,
-        // then rebuild for real: cell coverage (and therefore which empty cells exist, and the
-        // child z-order the touch dispatch depends on) changed, and only a rebuild fixes that up.
+        // then rebuild for real: which cells are empty changed, so the filler views that back them
+        // (and the long-press route to the add-widget menu) are stale until a rebuild.
         // isAttachedToWindow guard: see onSizeChanged's kdoc.
         editingItemView?.layoutParams = cellParams(col, row, spanX, spanY)
         overlayView?.layoutParams = cellParams(col, row, spanX, spanY)
@@ -1100,12 +1402,18 @@ class HomeGridView @JvmOverloads constructor(
      *
      * App shortcuts have no provider to ask, so anything from 1x1 up to the whole page is fine.
      *
-     * APP_LIST, DATE_TIME and CLOCK resize horizontally only. Their height is content-driven - one
-     * row per app slot, or the date/screen-time (DATE_TIME) or clock (CLOCK) block's own line count
-     * - so it follows from their settings dialog (HomeFragment.showAppListSettings/showDateTimeSettings),
-     * and letting a vertical drag contradict that would just produce squeezed or half-empty items
-     * that the next settings change silently undoes. `canResizeVertically = false` also means [buildOverlay] never
-     * adds a bottom handle for them, the same way it skips an axis a widget's provider disallows.
+     * DATE_TIME and CLOCK resize along one axis only: the one their content doesn't drive. Their
+     * height follows from the date/screen-time or clock block's own line count, so letting a drag
+     * contradict it would just produce squeezed or half-empty items that the next settings change
+     * silently undoes. A `false` flag also means [buildOverlay] never adds that axis' handle, the
+     * same way it skips an axis a widget's provider disallows.
+     *
+     * APP_LIST resizes along *both* axes, independently of slot count either way - dragging never
+     * adds or drops apps, it only gives the existing ones more or less room (same [MIN_TEXT_ITEM_SPAN_X]
+     * floor as everything else, up to the full grid). Slot count changes only through the settings
+     * dialog's stepper ([app.elauncher.data.resizeAppSlots]), which also picks that item's initial
+     * span for whichever axis is currently the content one per [GridItem.direction] - a later drag is
+     * then free to move it away from that starting point without touching `appSlots`.
      *
      * Widgets are clamped to what their provider declared: [AppWidgetProviderInfo.resizeMode] gates
      * each axis entirely (a handle for a disallowed axis is never even added), minResizeWidth/Height
@@ -1122,7 +1430,24 @@ class HomeGridView @JvmOverloads constructor(
             maxSpanX = columnCount.coerceAtLeast(1),
             maxSpanY = rowCount.coerceAtLeast(1),
         )
-        if (item.type == GridItemType.APP_LIST || item.type == GridItemType.DATE_TIME || item.type == GridItemType.CLOCK) {
+        if (item.type == GridItemType.APP_LIST) {
+            // Both axes are freely, independently resizable - slot count (appSlots.size) is set
+            // only via the settings dialog's stepper and never changes as a side effect of a drag.
+            // Growing/shrinking the content axis (the one direction used to derive from slot count)
+            // just gives the existing slots more or less room; it does not add or drop apps. This
+            // mirrors how the cross axis already behaved before this item type existed.
+            val maxSpanX = columnCount.coerceAtLeast(1)
+            val maxSpanY = rowCount.coerceAtLeast(1)
+            return ResizeConstraints(
+                canResizeHorizontally = true,
+                canResizeVertically = true,
+                minSpanX = MIN_TEXT_ITEM_SPAN_X.coerceAtMost(maxSpanX),
+                minSpanY = MIN_TEXT_ITEM_SPAN_X.coerceAtMost(maxSpanY),
+                maxSpanX = maxSpanX,
+                maxSpanY = maxSpanY,
+            )
+        }
+        if (item.type == GridItemType.DATE_TIME || item.type == GridItemType.CLOCK) {
             val maxSpanX = columnCount.coerceAtLeast(1)
             return ResizeConstraints(
                 canResizeHorizontally = true,
@@ -1204,10 +1529,16 @@ class HomeGridView @JvmOverloads constructor(
         private const val SETTINGS_GLYPH = "⚙"
 
         /**
-         * Narrowest an APP_LIST/DATE_TIME item may be dragged to, in cells. At 48dp cells one cell
-         * is not enough for a single line of an app name or a date to read as anything but
-         * truncated, so two is the floor - the item's own alignment/content settings are what its
-         * width is for, not fitting text into one cell.
+         * Smallest a text item (APP_LIST, on either resizable axis; DATE_TIME/CLOCK, on their one
+         * resizable axis) may be dragged to, in cells. At 48dp cells one cell is not enough for a
+         * single line of an app name or a date to read as anything but truncated, so two is the
+         * floor - the item's own alignment/content settings are what that span is for, not fitting
+         * text into one cell.
+         *
+         * Named for X because that was the only resizable axis when it was introduced; every other
+         * resizable axis since (App List's height, a horizontal App List's width) reuses the same
+         * value (see [resizeConstraints]), since "two cells of text" is the same floor regardless of
+         * which axis it's measured along.
          */
         private const val MIN_TEXT_ITEM_SPAN_X = 2
         private const val EDIT_FILL_ALPHA = 0x1A

@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.res.Configuration
 import android.content.res.Resources
 import android.view.Gravity
+import android.widget.LinearLayout
+import org.json.JSONArray
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -99,6 +101,82 @@ class PageSerializationTest {
         val roundTripped = pages.toJson().toPages()
 
         assertEquals(pages, roundTripped)
+    }
+
+    @Test
+    fun `GridItem with a non-zero zIndex survives toJson then toPages round trip`() {
+        val bottomItem = GridItem(
+            type = GridItemType.WIDGET,
+            col = 0,
+            row = 0,
+            spanX = 2,
+            spanY = 2,
+            zIndex = 0,
+            appWidgetId = 1,
+        )
+        val topItem = GridItem(
+            type = GridItemType.WIDGET,
+            col = 2,
+            row = 0,
+            spanX = 2,
+            spanY = 2,
+            zIndex = 5,
+            appWidgetId = 2,
+        )
+        val pages = listOf(
+            Page(id = "page-1", name = "Home", items = mutableListOf(bottomItem, topItem)),
+        )
+
+        val roundTripped = pages.toJson().toPages()
+
+        assertEquals(pages, roundTripped)
+        assertEquals(0, roundTripped[0].items[0].zIndex)
+        assertEquals(5, roundTripped[0].items[1].zIndex)
+    }
+
+    @Test
+    fun `GridItem with a non-default direction survives toJson then toPages round trip`() {
+        val appListItem = GridItem(
+            type = GridItemType.APP_LIST,
+            col = 0,
+            row = 0,
+            spanX = 4,
+            spanY = 2,
+            direction = LinearLayout.HORIZONTAL,
+        )
+        val pages = listOf(
+            Page(id = "page-1", name = "Home", items = mutableListOf(appListItem)),
+        )
+
+        val roundTripped = pages.toJson().toPages()
+
+        assertEquals(pages, roundTripped)
+        assertEquals(LinearLayout.HORIZONTAL, roundTripped[0].items[0].direction)
+    }
+
+    @Test
+    fun `old json lacking the direction key deserializes to VERTICAL`() {
+        val appListItem = GridItem(
+            type = GridItemType.APP_LIST,
+            col = 0,
+            row = 0,
+            spanX = 4,
+            spanY = 2,
+            direction = LinearLayout.HORIZONTAL,
+        )
+        val pages = listOf(
+            Page(id = "page-1", name = "Home", items = mutableListOf(appListItem)),
+        )
+        // Simulates JSON persisted before this field existed: strip the "direction" key that
+        // toJson() would otherwise have written, the same way a real pre-Step-1 save would lack it.
+        val array = JSONArray(pages.toJson())
+        val itemObject = array.getJSONObject(0).getJSONArray("items").getJSONObject(0)
+        itemObject.remove("direction")
+        val legacyJson = array.toString()
+
+        val roundTripped = legacyJson.toPages()
+
+        assertEquals(LinearLayout.VERTICAL, roundTripped[0].items[0].direction)
     }
 
     @Test

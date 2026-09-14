@@ -11,8 +11,9 @@ daily use.
 - **A real widget grid** — place Android app widgets on the home screen, move
   and resize them freely on a visible grid.
 - **App List widget** — the home-screen app shortcuts are now a widget: pick
-  1-8 apps, rename any of them, and set their alignment independently of
-  everything else on the page.
+  1-8 apps, rename any of them, set their alignment independently of
+  everything else on the page, and choose whether they lay out vertically or
+  horizontally.
 - **Clock and Date & Screen Time as separate widgets** — add either one only
   where you want it, each with its own alignment; the date widget can show
   screen time and links to the usage-access permission if it's missing.
