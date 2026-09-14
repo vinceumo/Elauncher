@@ -179,6 +179,12 @@
     <string name="change_app">Change app</string>
     <string name="remove_this_app">Remove this app</string>
     <string name="rename_app">Rename app</string>
+    <string name="move_or_resize">Move / Resize</string>
+    <string name="bring_to_front">Bring to front</string>
+    <string name="bring_forward">Bring forward</string>
+    <string name="send_backward">Send backward</string>
+    <string name="send_to_back">Send to back</string>
+    <string name="remove_widget">Remove</string>
     <string name="widget_unavailable">Widget unavailable\nTap to remove</string>
     <string name="widget_picker_empty">No widgets found</string>
     <string name="app_list_placeholder">App list</string>
@@ -191,6 +197,11 @@
     <string name="clock_settings">Clock settings</string>
     <string name="date_time_settings">Date and screen time</string>
     <string name="alignment">Alignment</string>
+    <string name="direction">Direction</string>
+    <string name="direction_vertical">Vertical</string>
+    <string name="direction_horizontal">Horizontal</string>
+    <string name="top">Top</string>
+    <string name="bottom">Bottom</string>
     <string name="number_of_apps">Number of apps</string>
     <string name="count_decrease" translatable="false">−</string>
     <string name="count_increase" translatable="false">+</string>

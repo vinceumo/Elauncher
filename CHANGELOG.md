@@ -3,6 +3,18 @@
 All notable changes to Elauncher are documented here. Elauncher is released
 only on GitHub — see [Releases](https://github.com/vinceumo/Elauncher/releases).
 
+## v7.2.0
+
+### Added
+- **Widgets can overlap** — drag one widget on top of another instead of
+  being blocked, then use its long-press menu's Bring to Front, Bring
+  Forward, Send Backward, or Send to Back to control which one shows on
+  top. Tap the same spot repeatedly to reach a widget hidden underneath.
+- **App List direction** — a new Direction setting lets an App List lay its
+  apps out horizontally instead of only vertically. Its width and height
+  can now be drag-resized independently, without changing how many apps
+  are shown.
+
 ## v7.1.0
 
 ### Added

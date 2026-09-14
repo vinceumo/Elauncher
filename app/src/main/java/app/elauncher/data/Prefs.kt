@@ -49,6 +49,7 @@ class Prefs(private val context: Context) {
     private val GRID_CELL_SIZE_DP = "GRID_CELL_SIZE_DP"
     private val APP_LIST_MIGRATION_DONE = "APP_LIST_MIGRATION_DONE"
     private val CLOCK_DATE_SPLIT_DONE = "CLOCK_DATE_SPLIT_DONE"
+    private val Z_INDEX_MIGRATION_DONE = "Z_INDEX_MIGRATION_DONE"
     private val PAGES_PRE_CLOCK_SPLIT_BACKUP = "PAGES_PRE_CLOCK_SPLIT_BACKUP"
     private val HIDE_SET_DEFAULT_LAUNCHER = "HIDE_SET_DEFAULT_LAUNCHER"
     private val SCREEN_TIME_LAST_UPDATED = "SCREEN_TIME_LAST_UPDATED"
@@ -298,13 +299,14 @@ class Prefs(private val context: Context) {
                 // need converting, so both branches go through the same pass. (For the blank
                 // synthetic page above both migrations are no-ops - nothing to convert, nothing to
                 // split - but they still run so their run-once markers get set.)
-                return splitDateTimeItems(migrateToAppLists(migrated))
+                return backfillZIndex(splitDateTimeItems(migrateToAppLists(migrated)))
             }
             val storedPages = stored.toPages()
             // App Lists first, then the clock/date split: the split's fallback placement scans
             // every item on the page, so it has to see the converted (APP -> APP_LIST) set and any
-            // item migrateToAppLists synthesized, not the pre-conversion one.
-            return splitDateTimeItems(migrateToAppLists(rescaleForCurrentCellSize(storedPages)))
+            // item migrateToAppLists synthesized, not the pre-conversion one. zIndex backfill runs
+            // last, against the final item list each page ends up with - see backfillZIndex's kdoc.
+            return backfillZIndex(splitDateTimeItems(migrateToAppLists(rescaleForCurrentCellSize(storedPages))))
         }
         set(value) = prefs.edit { putString(PAGES, value.toJson()).apply() }
 
@@ -422,6 +424,46 @@ class Prefs(private val context: Context) {
     }
 
     /**
+     * Marker for the one-time [backfillZIndex] pass, same run-once shape as [clockDateSplitDone]:
+     * set as soon as the backfill has run, and never cleared. Without it a second read would
+     * reassign zIndex by position again, overwriting any reordering the user has since done by hand.
+     */
+    var zIndexMigrationDone: Boolean
+        get() = prefs.getBoolean(Z_INDEX_MIGRATION_DONE, false)
+        set(value) = prefs.edit { putBoolean(Z_INDEX_MIGRATION_DONE, value).apply() }
+
+    /**
+     * One-time, guarded backfill of [GridItem.zIndex] for every item of every page, to a page's
+     * existing item-list order (0-based): `items[0].zIndex = 0`, `items[1].zIndex = 1`, etc.
+     *
+     * zIndex did not exist before this feature, so on the very first read after it ships, every
+     * item's zIndex is the [toGridItemOrNull] fallback of 0 - whether the stored JSON simply
+     * predates the field, or the page just came out of [migratePagesFromFlatSlots] /
+     * [migrateToAppLists] / [splitDateTimeItems] above, all of which now assign deliberate values
+     * but only for pages actually passing through them in this same read. Running this backfill
+     * last, against the final item list each page ends up with, means it never has to tell those
+     * two cases apart: a page whose items already carry deliberate, order-matching values (the
+     * fresh-install path) is simply restated with the same order it already had, while a page
+     * whose items are all still at the 0 fallback (any pre-existing install) gets real, distinct
+     * values for the first time - both are today's incidental list/insertion order, which is what
+     * keeps everyone's current visual stacking unchanged until they explicitly reorder.
+     *
+     * Guarded by the single [zIndexMigrationDone] flag rather than per-page content inspection -
+     * matching every other one-off migration in this file, and avoiding any attempt to guess
+     * "does this data already look migrated" from the zIndex values themselves. Persists its
+     * result immediately so the very next read is a plain load of already-backfilled data.
+     */
+    private fun backfillZIndex(storedPages: List<Page>): List<Page> {
+        if (zIndexMigrationDone) return storedPages
+        val backfilled = storedPages.map { page ->
+            page.copy(items = page.items.mapIndexed { index, item -> item.copy(zIndex = index) }.toMutableList())
+        }
+        zIndexMigrationDone = true
+        pages = backfilled
+        return backfilled
+    }
+
+    /**
      * The current source of truth for "is screen time actually being shown", matching what
      * SettingsFragment's screen-time row reports and what HomeFragment.applyScreenTime() gates on:
      * the usage-access permission on Q+. Deliberately not gated on [dateTimeVisibility] - that
@@ -456,6 +498,9 @@ class Prefs(private val context: Context) {
                     row = location - 1,
                     spanX = columnCount,
                     spanY = 1,
+                    // Brand-new page being synthesized from scratch here - stacking order matches
+                    // insertion (row) order since there's no prior zIndex to carry forward.
+                    zIndex = items.size,
                     appName = name,
                     appPackage = getAppPackage(location),
                     appActivityClassName = getAppActivityClassName(location),

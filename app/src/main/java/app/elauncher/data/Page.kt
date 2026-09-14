@@ -33,6 +33,13 @@ data class GridItem(
     var row: Int,
     var spanX: Int,
     var spanY: Int,
+    // Paint/touch order within this item's Page only - items on different pages never compare.
+    // Ascending: index 0 (lowest zIndex) paints/hit-tests first, i.e. bottom of the stack. Values
+    // need not be contiguous. Defaults to 0 so every pre-existing GridItem(...) call site compiles
+    // unchanged; construction sites that actually place an item are expected to pass this
+    // deliberately (see Page.kt's own helpers below and HomeFragment.kt's add*() methods) rather
+    // than rely on the default, which would silently collide with other items.
+    var zIndex: Int = 0,
     // APP fields (null when type == WIDGET):
     val appName: String? = null,
     val appPackage: String? = null,
@@ -47,6 +54,10 @@ data class GridItem(
     // APP_LIST/DATE_TIME/CLOCK field (unused otherwise); Gravity.START/CENTER_HORIZONTAL/END, same
     // values Prefs.homeAlignment/appLabelAlignment already use. The only field a CLOCK item uses:
     var alignment: Int = android.view.Gravity.START,
+    // APP_LIST field (unused otherwise); LinearLayout.VERTICAL/HORIZONTAL, raw constants same as
+    // alignment above. Defaults to VERTICAL so every existing saved App List (no such key in its
+    // JSON) and every pre-existing GridItem(...) call site keeps today's exact behavior.
+    var direction: Int = android.widget.LinearLayout.VERTICAL,
     // DATE_TIME fields (unused otherwise):
     var showScreenTime: Boolean = false,
     // Constants.DateTime.ON/OFF/DATE_ONLY - per-item counterpart to the old global
@@ -77,8 +88,9 @@ data class Page(
  * failing, hence GridItemRescaleTest pinning the direction.
  *
  * Best effort: rounding to whole cells can put two previously adjacent items one cell into each
- * other. Nothing here tries to resolve that - HomeGridView.fits() simply refuses further moves of
- * an overlapping item until the user drags it somewhere legal.
+ * other. Nothing here tries to resolve that - the caller that rescales a whole page does
+ * (List<Page>.rescaleForCellSize below), and an overlap that survives is a drawable layout rather
+ * than a broken one, so the user can always drag the items apart.
  */
 fun GridItem.rescaleForCellSize(
     oldCellSizeDp: Int,
@@ -98,19 +110,28 @@ fun GridItem.rescaleForCellSize(
 }
 
 /**
- * [rescaleForCellSize] applied to every item of every page, then resolves any collision the
- * rounding introduced between items that didn't overlap before.
+ * [rescaleForCellSize] applied to every item of every page, then resolves only the collisions the
+ * rounding itself introduced - overlaps the user put there on purpose are left alone.
  *
  * Each item is rescaled independently (its own col/row/spanX/spanY each rounded to the nearest
  * cell), so two previously-adjacent items can land on the same cell - e.g. at the 80dp->48dp
  * ratio (1.667), an item at col 1 (spanX 1) becomes col 2 (spanX 2, covering cols 2-3) while its
- * neighbor at col 2 becomes col 3, landing inside that span. Left unresolved,
- * HomeGridView.rebuildChildren()'s occupied-cell skip treats the later item's origin cell as
- * "covered" by the earlier one and stops rendering it entirely, rather than the two visibly
- * overlapping - the same failure mode HomeFragment.clampSpanYToOverlap() guards against for the
- * settings-driven resize path. Resolved the same way a newly-added item is placed
- * (synthesizedDateTimeItem, HomeFragment.addAppList()): first-fit against everything already
+ * neighbor at col 2 becomes col 3, landing inside that span. That is a rounding artifact the user
+ * never asked for, so it is undone: resolved the same way a newly-added item is placed
+ * ([synthesizedDateTimeItem], HomeFragment.addAppList()) - first-fit against everything already
  * placed on the page, in original order, so only the later, colliding item moves.
+ *
+ * Overlap is a supported layout now (items stack by [GridItem.zIndex] and every one of them
+ * renders), so a pair of items the user deliberately dropped on top of each other must survive a
+ * density change like any other part of their layout. The two cases are told apart by comparing
+ * *pairs*: every unordered pair of items that already overlapped at the old cell size is recorded
+ * before rescaling, and a pair that overlaps afterwards is only treated as accidental if it was not
+ * in that set. A pre-existing pair stays put even if rounding shifted exactly which cells it shares.
+ *
+ * Keying on pairs rather than on items is what makes the mixed case work: an item that intentionally
+ * overlapped one neighbor, and after rounding also lands on a second one, keeps the first overlap
+ * and is moved off the second - it is in the "leave alone" set for one pair and the "resolve" set
+ * for the other at the same time.
  */
 fun List<Page>.rescaleForCellSize(
     oldCellSizeDp: Int,
@@ -118,10 +139,28 @@ fun List<Page>.rescaleForCellSize(
     columnCount: Int,
     rowCount: Int,
 ): List<Page> = map { page ->
+    val originals = page.items
+    // Unordered pairs, held as (lower index, higher index) of the *original* list, which is also the
+    // order the loop below places them in - so the "was this pair already overlapping?" lookup for
+    // the item at `index` against an earlier item is always (earlier to index).
+    val intentionalOverlaps = mutableSetOf<Pair<Int, Int>>()
+    for (i in originals.indices) {
+        for (j in i + 1 until originals.size) {
+            val other = originals[j]
+            if (originals[i].overlaps(other.col, other.row, other.spanX, other.spanY)) {
+                intentionalOverlaps.add(i to j)
+            }
+        }
+    }
+
     val placed = mutableListOf<GridItem>()
-    page.items.forEach { original ->
+    originals.forEachIndexed { index, original ->
         val rescaled = original.rescaleForCellSize(oldCellSizeDp, newCellSizeDp, columnCount, rowCount)
-        val resolved = if (placed.any { it.overlaps(rescaled.col, rescaled.row, rescaled.spanX, rescaled.spanY) }) {
+        val hasAccidentalOverlap = placed.indices.any { earlier ->
+            (earlier to index) !in intentionalOverlaps &&
+                placed[earlier].overlaps(rescaled.col, rescaled.row, rescaled.spanX, rescaled.spanY)
+        }
+        val resolved = if (hasAccidentalOverlap) {
             val (col, row) = firstFreePosition(placed, rescaled.spanX, rescaled.spanY, columnCount, rowCount)
                 ?: (rescaled.col to rescaled.row)
             rescaled.copy(col = col, row = row)
@@ -135,6 +174,39 @@ fun List<Page>.rescaleForCellSize(
 
 /** How many (empty) slots a brand-new App List item is created with. */
 const val DEFAULT_APP_LIST_SLOT_COUNT = 4
+
+// Range an App List's slot count may be set to. One slot is the smallest thing still worth calling a
+// list; eight matches the launcher's long-standing home-app count (Prefs' appUser1..8 storage shape)
+// and keeps a full-width list inside one screen.
+//
+// Lives here rather than in HomeFragment (where it was, while it was the only place slot count was
+// ever set) because Page.kt is also where resizeAppSlots (below) lives, and both belong together.
+const val MIN_APP_LIST_SLOT_COUNT = 1
+const val MAX_APP_LIST_SLOT_COUNT = 8
+
+/**
+ * Grows or shrinks this item's [appSlots] to exactly [desiredCount] entries, in place.
+ *
+ * Growing appends empty [AppSlot]s (the "App" placeholder); shrinking drops the trailing ones -
+ * filled or not, immediately and unconfirmed, the same rule HomeFragment's removeGridItem() /
+ * clearAppSlot() already follow for comparably scoped actions (an app leaves the home screen;
+ * nothing is uninstalled). A no-op when the list is already the desired length.
+ *
+ * Called from exactly one place: the settings dialog's stepper (HomeFragment.applyAppListSettings) -
+ * the *only* thing that changes an App List's slot count. Resizing an item by drag
+ * (HomeGridView.commitGeometry) never calls this: both axes are freely, independently resizable and
+ * a drag only changes how much room the existing slots have, never how many there are - see
+ * HomeGridView.resizeConstraints' APP_LIST branch.
+ *
+ * [desiredCount] is coerced into [MIN_APP_LIST_SLOT_COUNT]..[MAX_APP_LIST_SLOT_COUNT] here rather
+ * than trusted: the one caller already bounds it, and a list of zero slots would render as nothing
+ * the user could get back.
+ */
+fun GridItem.resizeAppSlots(desiredCount: Int) {
+    val target = desiredCount.coerceIn(MIN_APP_LIST_SLOT_COUNT, MAX_APP_LIST_SLOT_COUNT)
+    while (appSlots.size < target) appSlots.add(AppSlot())
+    while (appSlots.size > target) appSlots.removeAt(appSlots.size - 1)
+}
 
 /**
  * Widest a *default-placed* App List / Date & Screen Time item is made, in cells.
@@ -175,10 +247,36 @@ fun defaultClockSpanX(columnCount: Int): Int = columnCount.coerceIn(1, MAX_DEFAU
  */
 fun defaultClockSpanY(): Int = 2
 
+/**
+ * Grid-driven width for a *vertical* App List: the axis the slot count doesn't drive.
+ *
+ * The direction-aware pair of these four functions is picked by [GridItem.direction]: a vertical
+ * list takes its width from the grid ([defaultAppListSpanX]) and its height from the slot count
+ * ([defaultAppListSpanY]); a horizontal one swaps them ([defaultAppListSpanXForSlots] /
+ * [defaultAppListSpanYForGrid]).
+ */
 fun defaultAppListSpanX(columnCount: Int): Int = columnCount.coerceIn(1, MAX_DEFAULT_SPAN_X)
 
-/** One slot per grid row, matching the single-vertical-column look the App List keeps. */
+/** One slot per grid row, matching the single-vertical-column look a vertical App List keeps. */
 fun defaultAppListSpanY(slotCount: Int): Int = slotCount.coerceAtLeast(1)
+
+/**
+ * One slot per grid *column*, for a horizontal App List - the mirror of [defaultAppListSpanY].
+ *
+ * Deliberately not floored at HomeGridView's MIN_TEXT_ITEM_SPAN_X: the invariant that carries
+ * the whole feature is one slot per cell along the list's direction (appSlots.size == spanX when
+ * horizontal, == spanY when vertical), and widening a one-slot list to two cells would break it for
+ * the renderer. The readability floor still applies to the axis the user drags (see
+ * HomeGridView.resizeConstraints), which for a horizontal list is its height.
+ */
+fun defaultAppListSpanXForSlots(slotCount: Int): Int = slotCount.coerceAtLeast(1)
+
+/**
+ * Grid-driven height for a *horizontal* App List: the mirror of [defaultAppListSpanX], capped by the
+ * same [MAX_DEFAULT_SPAN_X] budget (there is no separate row-count constant in the codebase, and the
+ * cap is a "don't stretch a default-placed item across the whole page" rule, not an X-axis one).
+ */
+fun defaultAppListSpanYForGrid(rowCount: Int): Int = rowCount.coerceIn(1, MAX_DEFAULT_SPAN_X)
 
 /**
  * What a brand-new page starts with: nothing.
@@ -225,6 +323,10 @@ fun List<Page>.migrateAppItemsToAppLists(
                 row = item.row,
                 spanX = item.spanX,
                 spanY = item.spanY,
+                // Same item, new type - carries the original's stacking position forward rather
+                // than defaulting to 0, which would silently collide with Step 2's backfilled
+                // indices for other real items on the page.
+                zIndex = item.zIndex,
                 appSlots = mutableListOf(
                     AppSlot(
                         appName = item.appName,
@@ -281,6 +383,8 @@ private fun synthesizedDateTimeItem(
         row = row,
         spanX = spanX,
         spanY = spanY,
+        // Brand-new item being added to the page: lands on top, same as any other newly-added item.
+        zIndex = (existing.maxOfOrNull { it.zIndex } ?: -1) + 1,
         alignment = alignment,
         showScreenTime = showScreenTime,
         dateTimeVisibility = dateTimeVisibility,
@@ -353,6 +457,10 @@ fun List<GridItem>.splitDateTimeIntoClockAndDate(columnCount: Int, rowCount: Int
             row = item.row,
             spanX = clockSpanX,
             spanY = clockSpanY,
+            // One pre-split item becomes two; both inherit its stacking position (tying at the same
+            // zIndex) rather than the clock jumping to the top - this is a split of existing content,
+            // not the user adding something new.
+            zIndex = item.zIndex,
             alignment = item.alignment,
         )
         // Everything the two new items must not land on: what this pass has already emitted, plus
@@ -379,9 +487,27 @@ fun List<GridItem>.splitDateTimeIntoClockAndDate(columnCount: Int, rowCount: Int
     return result
 }
 
-private fun GridItem.overlaps(col: Int, row: Int, spanX: Int, spanY: Int): Boolean =
+/**
+ * Whether this item's footprint intersects the [spanX] x [spanY] footprint at ([col], [row]).
+ *
+ * Not private any more (it was, while only this file's placement helpers used it): with
+ * HomeGridView rendering one view per *item* rather than one per grid cell, "is this cell free"
+ * is no longer answerable from a cell-keyed map and is asked of the items themselves instead -
+ * see [coversCell].
+ */
+internal fun GridItem.overlaps(col: Int, row: Int, spanX: Int, spanY: Int): Boolean =
     col < this.col + this.spanX && this.col < col + spanX &&
         row < this.row + this.spanY && this.row < row + spanY
+
+/**
+ * Whether this item's footprint contains the single cell ([col], [row]) - [overlaps] against a
+ * 1x1 footprint, i.e. the point-in-rect special case.
+ *
+ * This is what "is this cell empty?" reduces to now that nothing builds a cell-keyed occupancy map:
+ * a cell is empty when no item on the page covers it. Deliberately phrased in terms of [overlaps]
+ * rather than restating the inequalities, so overlap has exactly one definition on the data side.
+ */
+internal fun GridItem.coversCell(col: Int, row: Int): Boolean = overlaps(col, row, 1, 1)
 
 /** First row-major (col, row) where a [spanX] x [spanY] footprint hits nothing, or null if none. */
 private fun firstFreePosition(
@@ -404,6 +530,7 @@ private const val KEY_COL = "col"
 private const val KEY_ROW = "row"
 private const val KEY_SPAN_X = "spanX"
 private const val KEY_SPAN_Y = "spanY"
+private const val KEY_Z_INDEX = "zIndex"
 private const val KEY_APP_NAME = "appName"
 private const val KEY_APP_PACKAGE = "appPackage"
 private const val KEY_APP_ACTIVITY_CLASS_NAME = "appActivityClassName"
@@ -413,6 +540,7 @@ private const val KEY_SHORTCUT_ID = "shortcutId"
 private const val KEY_APP_WIDGET_ID = "appWidgetId"
 private const val KEY_APP_SLOTS = "appSlots"
 private const val KEY_ALIGNMENT = "alignment"
+private const val KEY_DIRECTION = "direction"
 private const val KEY_SHOW_SCREEN_TIME = "showScreenTime"
 private const val KEY_DATE_TIME_VISIBILITY = "dateTimeVisibility"
 private const val KEY_CUSTOM_LABEL = "customLabel"
@@ -446,6 +574,7 @@ private fun GridItem.toJsonObject(): JSONObject = JSONObject().apply {
     put(KEY_ROW, row)
     put(KEY_SPAN_X, spanX)
     put(KEY_SPAN_Y, spanY)
+    put(KEY_Z_INDEX, zIndex)
     put(KEY_APP_NAME, appName ?: JSONObject.NULL)
     put(KEY_APP_PACKAGE, appPackage ?: JSONObject.NULL)
     put(KEY_APP_ACTIVITY_CLASS_NAME, appActivityClassName ?: JSONObject.NULL)
@@ -455,6 +584,7 @@ private fun GridItem.toJsonObject(): JSONObject = JSONObject().apply {
     put(KEY_APP_WIDGET_ID, appWidgetId ?: JSONObject.NULL)
     put(KEY_APP_SLOTS, JSONArray().apply { appSlots.forEach { put(it.toJsonObject()) } })
     put(KEY_ALIGNMENT, alignment)
+    put(KEY_DIRECTION, direction)
     put(KEY_SHOW_SCREEN_TIME, showScreenTime)
     put(KEY_DATE_TIME_VISIBILITY, dateTimeVisibility)
 }
@@ -479,6 +609,10 @@ private fun JSONObject.toGridItemOrNull(): GridItem? {
         row = optInt(KEY_ROW, 0),
         spanX = optInt(KEY_SPAN_X, 1),
         spanY = optInt(KEY_SPAN_Y, 1),
+        // Fallback 0 for JSON saved before this field existed - not a meaningful ordering (every
+        // such item ties at 0), just enough for old data to parse without crashing. Step 2 backfills
+        // real, distinct values for existing pages.
+        zIndex = optInt(KEY_Z_INDEX, 0),
         appName = if (isNull(KEY_APP_NAME)) null else optString(KEY_APP_NAME),
         appPackage = if (isNull(KEY_APP_PACKAGE)) null else optString(KEY_APP_PACKAGE),
         appActivityClassName = if (isNull(KEY_APP_ACTIVITY_CLASS_NAME)) null else optString(KEY_APP_ACTIVITY_CLASS_NAME),
@@ -488,6 +622,7 @@ private fun JSONObject.toGridItemOrNull(): GridItem? {
         appWidgetId = if (isNull(KEY_APP_WIDGET_ID)) null else optInt(KEY_APP_WIDGET_ID),
         appSlots = appSlots,
         alignment = optInt(KEY_ALIGNMENT, android.view.Gravity.START),
+        direction = optInt(KEY_DIRECTION, android.widget.LinearLayout.VERTICAL),
         showScreenTime = optBoolean(KEY_SHOW_SCREEN_TIME, false),
         dateTimeVisibility = optInt(KEY_DATE_TIME_VISIBILITY, Constants.DateTime.ON),
     )
